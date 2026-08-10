@@ -5,3 +5,4 @@ notebooks/data copy.ipynb
 /build
 __pycache__
 /runs
+/logs

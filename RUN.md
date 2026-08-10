@@ -11,6 +11,21 @@ All commands below assume `$PY` and that you are in the repo root.
 
 ---
 
+## TL;DR — just run everything
+
+```bash
+./run_experiments.sh
+```
+
+That builds the dataset (if needed), runs all 14 models × 4 horizons with automatic
+GPU allocation, writes a log per run, and prints the results table. Resume after an
+interruption with `./run_experiments.sh --resume`.
+
+See §8 for the script's options. The rest of this document is the manual path, which
+you want when debugging a single model.
+
+---
+
 ## 0 · Environment
 
 The `ecg_cpc` conda env, with these versions verified working on the 8× Tesla V100s:
@@ -327,7 +342,93 @@ across four as in §3.7.
 
 ---
 
-## 7 · Before you submit anything
+## 7 · The driver script
+
+`./run_experiments.sh` wraps everything above with scheduling, logging and resume.
+
+### How it allocates GPUs
+
+Two independent pools:
+
+- **GPU pool** — one slot per *available* GPU. A GPU counts as available when its
+  used memory is below `--gpu-free-mb` (default 2000 MiB), so the script co-exists
+  with other people's jobs on a shared box.
+- **CPU pool** — `min(4, cores/24)` slots by default.
+
+`xgboost`, `catboost_gpu`, `tabpfn` and the five neural nets take a GPU slot;
+`persistence`, `linear_trend`, `lightgbm`, `catboost`, `histgb`, `randomforest` and
+`extratrees` take a CPU slot and never occupy a GPU. The scheduler walks the pending
+queue each pass and launches the first job whose *own* pool has a free slot, so a
+backed-up GPU queue never stalls ready CPU jobs.
+
+Each GPU job runs with `CUDA_VISIBLE_DEVICES` pinned to one device and is passed
+`--gpu 0`, so the child sees exactly one GPU as ordinal 0. That keeps allocation
+correct even if `CUDA_VISIBLE_DEVICES` is already set in your shell, and stops one
+job's allocator from reserving memory on its neighbours — which matters because
+TabPFN will happily take 31 GB.
+
+`--n-jobs` is divided among concurrent runs so parallel CPU learners don't thrash
+the 96 cores.
+
+### What it writes
+
+```
+logs/<timestamp>/           (also symlinked as logs/latest)
+├── master.log              everything, timestamped
+├── build.log               dataset build output
+├── status.tsv              tag, status, rc, seconds, device, MARD, log path
+└── runs/<tag>.log          one per run, with the exact command at the top
+runs/<tag>/result.json      metrics, per-cohort breakdown, model notes
+runs/results.csv            the collected table
+```
+
+A failed run is logged with its exit code and the last 3 lines of its output, the
+sweep carries on, and the script exits non-zero at the end. Slots are released via
+an `EXIT` trap, so a crashed job never leaks its GPU.
+
+### Options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--models "a b c"` | all 14 | which learners |
+| `--horizons "30 60"` | all 4 | which horizons |
+| `--split` | `official` | `official` / `subject` / `cohort` |
+| `--folds "0 1 2"` | `0` | for `--split subject` |
+| `--cohorts "Loop ..."` | — | required for `--split cohort` |
+| `--gpus 2,3` | auto-detect | force specific GPUs |
+| `--gpu-free-mb N` | `2000` | memory below which a GPU counts as free |
+| `--gpu-jobs N` | one per GPU | cap concurrent GPU runs |
+| `--cpu-jobs N` | `min(4, cores/24)` | cap concurrent CPU runs |
+| `--stride N` | `6` | passed to the build |
+| `--data DIR` | `build/main` | dataset to train on |
+| `--runs-dir DIR` | `runs` | where results go |
+| `--resume` | off | skip runs that already have a `result.json` |
+| `--skip-build` | off | dataset already exists |
+| `--build-only` | off | build and stop |
+| `--collect-only` | off | just regenerate the table |
+| `--dry-run` | off | print the plan and pool assignment, run nothing |
+| `--python PATH` | `ecg_cpc` python | interpreter to use |
+
+### Examples
+
+```bash
+./run_experiments.sh --dry-run                      # check the plan first
+./run_experiments.sh --resume                       # continue an interrupted sweep
+./run_experiments.sh --gpus 4,5,6,7 --cpu-jobs 2    # share the box politely
+./run_experiments.sh --skip-build --models "xgboost catboost mlp" --horizons 30
+./run_experiments.sh --split cohort --horizons 30 \
+    --models "xgboost mlp" --cohorts "Loop ReplaceBG IOBP2 PEDAP"
+./run_experiments.sh --collect-only                 # rebuild results.csv
+```
+
+Verified on this box: 5 jobs (2 CPU + 3 GPU) dispatched simultaneously to cpu-slot-0,
+gpu0, gpu1, cpu-slot-1, gpu2; resume correctly skipped 5 completed runs; a deliberately
+broken run was logged as `[FAIL]`, released its GPU, let the other jobs finish, and
+the script exited 1.
+
+---
+
+## 8 · Before you submit anything
 
 The error-grid numbers here are **Clarke** and **Parkes**, not the official
 **DTS / Surveillance Error Grid** — that one needs the organisers' toolkit, which is
