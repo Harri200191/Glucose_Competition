@@ -3,22 +3,24 @@
 The competition scores **MARD** and **error-grid A-zone %** as two independent
 tracks, with RMSE only breaking ties (README).
 
-Caveat you must read before trusting the grid numbers
------------------------------------------------------
-The official track uses the **DTS / Surveillance Error Grid** (Klonoff et al.),
-whose zones come from a published continuous risk surface, not a closed-form
-boundary set. That surface ships with the organisers' toolkit, which is not
-vendored in this repo. What is implemented here is:
+Which grid is official
+----------------------
+The competition scores the **DTS Error Grid** (Klonoff et al. 2024, JDST
+18(6):1346-1361, DOI 10.1177/19322968241275701). Its five zones have straight-line
+borders whose exact coordinates are published in Supplemental Appendix 2 of that
+paper. `exp/dts_grid.py` implements the grid; it reads those coordinates from
+`exp/dts_boundaries.json`, which you supply once (see that module's docstring --
+it is a copy-paste job, no code changes). The grid is public domain.
 
-  * **Clarke** error grid -- the classical formulation, unambiguous and widely
-    reimplemented;
-  * **Parkes / Consensus** error grid for Type 1 -- from the published boundary
-    vertices in Pfützner et al. (2013).
+**Until that file exists, `evaluate()` reports no DTS columns at all** rather than
+substituting a lookalike. Two published relatives are always computed:
 
-Both are reasonable proxies for "how clinically dangerous is this error", and
-Parkes is the closer relative of the DTS grid. Neither is a substitute for the
-official scorer: **re-score with the organisers' toolkit before submitting.**
-`dts_zones()` is a stub that makes that explicit rather than silently wrong.
+  * **Clarke** -- the classical formulation, unambiguous and widely reimplemented;
+  * **Parkes / Consensus** Type 1 -- from the boundary vertices in Pfützner et al.
+    (2013). The closest relative of the DTS grid, and like it asymmetric about the
+    identity line.
+
+Use those for model selection. Do not report either as a DTS number.
 """
 from __future__ import annotations
 
@@ -148,13 +150,15 @@ def parkes_zones(y_true, y_pred) -> np.ndarray:
     return zone
 
 
-def dts_zones(y_true, y_pred):
-    """The official DTS / Surveillance Error Grid. Not reimplemented here."""
-    raise NotImplementedError(
-        "The DTS Surveillance Error Grid is defined by a published risk surface that "
-        "ships with the organisers' toolkit, not by closed-form boundaries. Score with "
-        "the official toolkit; use parkes_zones() as the local proxy."
-    )
+def dts_zones(y_true, y_pred, path=None) -> np.ndarray:
+    """Official DTS Error Grid zone per point.
+
+    Delegates to `exp.dts_grid`, which needs `exp/dts_boundaries.json` (Supplemental
+    Appendix 2 of Klonoff et al. 2024). Raises `DTSBoundariesUnavailable` with
+    instructions if that file has not been supplied.
+    """
+    from .dts_grid import dts_zones as _dts
+    return _dts(y_true, y_pred, path=path)
 
 
 def zone_fractions(zones: np.ndarray) -> dict[str, float]:
@@ -188,6 +192,16 @@ def evaluate(y_true, y_pred) -> dict[str, float]:
     res.update({f"clarke_{k[5:]}": v for k, v in ck.items()})
     pk = zone_fractions(parkes_zones(t, p))
     res.update({f"parkes_{k[5:]}": v for k, v in pk.items()})
+
+    # The official grid, only if its coordinates have been supplied. Absent columns
+    # are the honest signal that this run was not scored on the official metric.
+    try:
+        from . import dts_grid
+        if dts_grid.available():
+            dz = zone_fractions(dts_grid.dts_zones(t, p))
+            res.update({f"dts_{k[5:]}": v for k, v in dz.items()})
+    except Exception as e:                                       # noqa: BLE001
+        res["dts_error"] = f"{type(e).__name__}: {e}"
     return res
 
 

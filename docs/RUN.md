@@ -428,10 +428,52 @@ the script exited 1.
 
 ---
 
-## 8 · Before you submit anything
+## 8 · Enabling the official DTS error grid
 
-The error-grid numbers here are **Clarke** and **Parkes**, not the official
-**DTS / Surveillance Error Grid** — that one needs the organisers' toolkit, which is
-not vendored in this repo. `exp/metrics.py::dts_zones()` raises deliberately rather
-than returning a plausible wrong number. Re-score with the official scorer before
-trusting any zone-A figure. See `DATA_PIPELINE.md` §11.
+The competition's error-grid track uses the **DTS Error Grid** (Klonoff et al. 2024,
+JDST 18(6):1346–1361, DOI [10.1177/19322968241275701](https://doi.org/10.1177/19322968241275701)).
+It is fully implemented in `exp/dts_grid.py` but needs its border coordinates, which
+are published only in Supplemental Appendix 2 of that paper and are not machine-
+retrievable (SAGE 403s, PMC has a bot challenge, the article is not open-access).
+
+One-time, about five minutes:
+
+```bash
+# 1. download Supplemental Appendix 2 in a browser
+#    https://journals.sagepub.com/doi/suppl/10.1177/19322968241275701
+#    or PMC11531029 -> Supplementary Materials -> sj-docx-1-dst-...docx
+
+# 2. transcribe the vertex table
+cp exp/dts_boundaries.template.json exp/dts_boundaries.json
+$EDITOR exp/dts_boundaries.json     # [reference, monitor] pairs in mg/dL
+
+# 3. verify against the official tool
+$PY -m exp.dts_grid --selftest
+```
+
+`--selftest` prints a zone table across reference × relative error to diff against
+<https://www.diabetestechnology.org/dtseg/>, and checks two invariants: perfect
+predictions must all land in zone A, and zones must worsen monotonically as the error
+grows.
+
+Once `exp/dts_boundaries.json` exists, every run automatically gains `dts_A` …
+`dts_E` and `dts_AB` columns — no other change, and no need to re-run the dataset
+build. Re-score existing runs with:
+
+```bash
+$PY -c "from exp.run_all import collect; collect()"
+```
+
+**Until then, no `dts_*` column is emitted at all.** That absence is deliberate: a
+missing column is an honest signal that the run was not scored on the official
+metric, whereas a lookalike number would quietly be wrong. `Clarke` and `Parkes` are
+always reported and are fine for ranking models against each other — just don't
+report them as DTS figures.
+
+---
+
+## 9 · Before you submit anything
+
+Confirm `dts_*` columns are present in `runs/results.csv` (i.e. §8 is done), and
+sanity-check a handful of predictions against the official tool. The Clarke and
+Parkes numbers are proxies and should not appear in a submission writeup.

@@ -1,0 +1,45 @@
+{
+  "_README": [
+    "DTS Error Grid straight-line border coordinates.",
+    "",
+    "Source: Klonoff DC et al. 'The Diabetes Technology Society Error Grid and Trend",
+    "Accuracy Matrix for Glucose Monitors.' J Diabetes Sci Technol 2024;18(6):1346-1361.",
+    "DOI 10.1177/19322968241275701 -- Supplemental Appendix 2.",
+    "The grid is not trademarked and is in the public domain.",
+    "",
+    "TO USE: copy this file to exp/dts_boundaries.json, replace every vertex list",
+    "below with the published coordinates, and delete the _TODO keys. Then run",
+    "  python -m exp.dts_grid --selftest",
+    "and diff the printed zone table against https://www.diabetestechnology.org/dtseg/",
+    "",
+    "FORMAT",
+    "  Each vertex is [reference_glucose, monitor_glucose] in mg/dL, listed in",
+    "  increasing reference order along the border.",
+    "  'upper' borders lie ABOVE the identity line (monitor reads high -- the riskier",
+    "  side, so these sit closer to the diagonal).",
+    "  'lower' borders lie BELOW it (monitor reads low).",
+    "  A point is in zone B if it is outside the AB border, C if outside BC, and so on;",
+    "  the outermost border it clears wins.",
+    "  Omit a border entirely if the published grid does not define it on that side",
+    "  (for example the Parkes Type 1 grid has no zone E below the diagonal).",
+    "",
+    "The placeholder numbers below are the PARKES TYPE 1 borders, present only so the",
+    "file parses and the plumbing can be exercised. They are NOT the DTS grid.",
+    "Reporting them as DTS numbers would be wrong."
+  ],
+  "_TODO": "REPLACE ALL COORDINATES BELOW WITH DTS SUPPLEMENTAL APPENDIX 2",
+  "_units": "mg/dL",
+  "_source": "PLACEHOLDER (Parkes Type 1) -- replace with Klonoff 2024 Appendix 2",
+
+  "upper": {
+    "AB": [[0, 50], [30, 50], [140, 170], [280, 380], [430, 550]],
+    "BC": [[0, 60], [30, 60], [50, 80], [70, 110], [260, 550]],
+    "CD": [[0, 100], [25, 100], [50, 125], [80, 215], [125, 550]],
+    "DE": [[0, 150], [35, 155], [50, 550]]
+  },
+  "lower": {
+    "AB": [[50, 0], [50, 30], [170, 145], [385, 300], [550, 450]],
+    "BC": [[120, 0], [120, 30], [260, 130], [550, 250]],
+    "CD": [[250, 0], [250, 40], [410, 110], [550, 160]]
+  }
+}

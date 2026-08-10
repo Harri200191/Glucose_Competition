@@ -132,6 +132,8 @@ def collect(runs_dir: Path = RUNS_DIR) -> pd.DataFrame:
             "MARD": t.get("MARD"), "RMSE": t.get("RMSE"), "MAE": t.get("MAE"),
             "clarke_A": t.get("clarke_A"), "clarke_AB": t.get("clarke_AB"),
             "parkes_A": t.get("parkes_A"), "parkes_AB": t.get("parkes_AB"),
+            # present only once exp/dts_boundaries.json is supplied (see RUN.md §8)
+            "dts_A": t.get("dts_A"), "dts_AB": t.get("dts_AB"),
             "MARD_hypo": t.get("MARD_hypo_lt70"),
             "MARD_subj_mean": s.get("MARD_subject_mean"),
             "MARD_subj_p90": s.get("MARD_subject_p90"),
@@ -152,6 +154,8 @@ def collect(runs_dir: Path = RUNS_DIR) -> pd.DataFrame:
               f"{'-'*(70 - len(str(split)))}")
         cols = ["model", "family", "n_train", "MARD", "RMSE", "clarke_A",
                 "parkes_A", "MARD_subj_mean", "fit_s"]
+        if g["dts_A"].notna().any():          # official grid enabled
+            cols.insert(6, "dts_A")
         print(g[cols].to_string(index=False, float_format=lambda v: f"{v:,.3f}"))
     return df
 
