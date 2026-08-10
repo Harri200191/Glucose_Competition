@@ -245,10 +245,16 @@ def build_feature_matrix(df: pd.DataFrame, seg_id: np.ndarray, cgm_f: np.ndarray
         put(f"cgm_range_{w}", mx - mn)
         del mn, mx
     for hl in fc.ewm_halflives:
+        # The EWM runs over the whole array and is only hard-reset on the first row
+        # of each segment. Rows just after a boundary therefore retain a little
+        # weight from the previous segment -- but with half-lives of 3-12 steps that
+        # decays to nothing within ~50 rows, and an anchor is required to have 288
+        # rows of in-segment history (see build_dataset), so **no anchor is ever
+        # affected**. A per-segment loop would be exact and 1,909x slower for no
+        # change to any value that is actually used.
         e = pd.Series(cgm_f, dtype="float64").ewm(halflife=hl, ignore_na=True).mean().to_numpy()
-        bad = np.zeros(len(e), dtype=bool)
-        bad[1:] = seg_id[1:] != seg_id[:-1]
-        e[np.flatnonzero(bad)] = cgm_f[np.flatnonzero(bad)]   # reset at segment start
+        bnd = np.flatnonzero(np.concatenate(([True], seg_id[1:] != seg_id[:-1])))
+        e[bnd] = cgm_f[bnd]
         put(f"cgm_ewm_{hl}", e)
         del e
 

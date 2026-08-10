@@ -429,12 +429,41 @@ Also reported **per subject** (mean, median, p90, worst) and **per cohort**. EDA
 
 ### Training objective
 
-**[CHOICE] Every model regresses `log(glucose)` under an L1-type loss.**
+**[CHOICE 1] Every model regresses `log(glucose)` under an L1-type loss.**
 
 `d|log p − log t| / dp ∝ 1/p`, which is the same `1/t` weighting MARD applies. So the
 training signal matches the scoring metric, and capacity goes to the hypoglycaemic
 end — which EDA 9.2 showed dominates MARD despite being ~4 % of readings. Squared
 error on the raw scale remains available (`xgboost_l2`, `catboost_gpu`) as a control.
+
+**[CHOICE 2] The neural nets predict a *residual on persistence*, not the level.**
+
+The networks output `log(g_{t+h}) − log(g_t)` and the prediction is
+`exp(log(cgm_now) + Δ)`.
+
+This turned out to matter more than any architecture choice. EDA 9.6 measured
+persistence at MARD 14.03 % using no features at all, so a network regressing the
+absolute level burns its early epochs rediscovering "output roughly the current
+value" — and, worse, keeps oscillating around it. Measured on the 40-subject smoke
+set at the 30-minute horizon:
+
+| Model | Absolute target | Residual target |
+|---|---|---|
+| `mlp` | 12.87 % | **10.21 %** |
+| `resmlp` | 10.73 % | **10.27 %** |
+| `ft_transformer` | 11.39 % | **10.30 %** |
+| `tcn` | 14.03 % (worse than persistence) | **10.31 %** |
+| `gru` | 11.14 % | **10.39 %** |
+
+The TCN was the clearest case: with the absolute target its validation MARD went
+153 % → 14.4 % → 32.2 % → 26.8 % across epochs and early-stopped having never beaten
+persistence. With the residual target it starts at ≈persistence by construction and
+improves monotonically.
+
+Disable with `--set residual_on_persistence=false` to reproduce the left column.
+
+The tree models do **not** need this — a tree can put `cgm_now` at the root and get
+the same effect for free, which is exactly what they do.
 
 ---
 

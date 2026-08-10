@@ -262,6 +262,47 @@ MARD of **14.03 / 22.71 / 28.41 / 32.32 %** at 30/60/90/120 min, and `linear_tre
 must come out *worse* at every horizon. If either is off, the feature/target
 alignment is broken and no other number means anything.
 
+### What the smoke test actually produced
+
+Every model below was run end-to-end on `build/smoke` (40 subjects, 172,509 samples,
+107,853 training rows, 30-min horizon, subject split). These are **not** the numbers
+to expect from the full corpus — 40 subjects is far too few to separate the models —
+but they confirm every code path works and every learner beats the baseline.
+
+| model | family | MARD % | RMSE | Clarke-A % | fit s |
+|---|---|---|---|---|---|
+| `mlp` | nn | **10.214** | 19.59 | 87.03 | 9 |
+| `resmlp` | nn | 10.271 | 19.70 | 86.94 | 14 |
+| `ft_transformer` | nn | 10.297 | 19.75 | 86.76 | 136 |
+| `tcn` | nn | 10.312 | 19.54 | 86.75 | 41 |
+| `catboost` | gbdt | 10.316 | 19.54 | 86.77 | 27 |
+| `lightgbm` | gbdt | 10.318 | **19.43** | 86.72 | 12 |
+| `xgboost` | gbdt | 10.318 | 19.50 | 86.73 | 8 |
+| `tabpfn` | pfn | 10.318 | 19.59 | 86.80 | 16 |
+| `histgb` | gbdt | 10.358 | 19.48 | 86.64 | 157 |
+| `gru` | nn | 10.390 | 19.68 | 86.41 | 22 |
+| `randomforest` | forest | 10.441 | 19.86 | 86.45 | 11 |
+| `extratrees` | forest | 10.486 | 19.93 | 86.24 | 8 |
+| `persistence` | baseline | 13.133 | 24.77 | 79.43 | 0 |
+| `linear_trend` | baseline | 14.731 | 28.81 | 76.91 | 0 |
+
+Sanity checks this confirms: every learner beats persistence by ~2.8 MARD points,
+`linear_trend` is *worse* than persistence exactly as EDA 9.6 predicted, and the
+neural nets are competitive with the GBDTs only because of the residual
+parameterisation (see `DATA_PIPELINE.md` §11 — without it the TCN scored 14.03 %,
+i.e. worse than doing nothing).
+
+Note `tabpfn` matched the GBDTs while seeing only **37 % of the training rows**
+(4 bagged contexts × 10,000 rows, 100 of 113 features). That ratio falls as the
+dataset grows — on the full corpus it will see 40,000 of ~10 M rows, i.e. 0.4 % — so
+treat its full-corpus number as a small-context result, not a like-for-like
+comparison. `result.json → model_notes` records the exact fraction for every run.
+
+**GPU memory:** TabPFN attends every query row against its whole context, so peak
+memory is `O(chunk × context × n_estimators)`. The prediction chunk is 10,000, which
+fits comfortably on a 32 GB V100; at 50,000 it peaked at 31 GB and OOM'd anything
+sharing the device. If you run TabPFN alongside another job, give it its own GPU.
+
 ---
 
 ## 6 · Expected runtimes (154 M-row corpus, stride 6)

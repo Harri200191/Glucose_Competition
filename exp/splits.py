@@ -35,10 +35,19 @@ def official_split(meta: pd.DataFrame, val_frac: float = 0.12, seed: int = 0
     """The competition's own split, with a subject-disjoint val slice from train.
 
     Returns boolean masks: train, val, test.
+
+    The 166-169 subjects that sit on both sides of `is_test` (EDA 11.1) are
+    **excluded from the validation pool**. Their train rows are legitimate training
+    data, but using them for early stopping would tune the stopping point on people
+    who also appear in test.
     """
     is_test = meta["is_test"].to_numpy().astype(bool)
     train_all = ~is_test
-    val = _subject_holdout(meta["subject"], train_all, val_frac, seed)
+
+    both = set(pd.unique(meta["subject"][is_test]))
+    val_pool = train_all & ~meta["subject"].isin(both).to_numpy()
+    val = _subject_holdout(meta["subject"], val_pool, val_frac, seed)
+
     train = train_all & ~val
     return {"train": train, "val": val, "test": is_test}
 

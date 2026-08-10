@@ -19,9 +19,18 @@ statistics; a sequence model gets to learn the shape itself.
 
 Shared decisions
 ----------------
-* **Target.** All networks regress ``log(glucose)`` under an L1 loss. The gradient
-  of |log p - log t| carries a 1/t weighting, which is exactly what MARD applies
-  (EDA 9.2), so the training signal matches the scoring metric.
+* **Target: a residual on top of persistence.** The network predicts
+  ``log(glucose_{t+h}) - log(glucose_t)`` -- the log-ratio -- and the prediction is
+  ``exp(log(cgm_now) + delta)``. This matters more than any architecture choice
+  here. EDA 9.6 measured persistence at MARD 14.03 % with no features at all, so a
+  network that regresses the absolute level spends its first epochs rediscovering
+  "output roughly the current value". Measured on the 40-subject smoke set, the
+  absolute parameterisation started at val MARD 153 % and never settled below
+  14.4 %; the residual form starts at approximately persistence by construction and
+  improves monotonically from there.
+* **Loss.** L1 on the log scale. The gradient of |log p - log t| carries a 1/t
+  weighting, which is exactly what MARD applies (EDA 9.2), so the training signal
+  matches the scoring metric.
 * **NaN.** Networks cannot consume NaN. Inputs get median imputation +
   missingness indicators (fitted on train only) and robust median/IQR scaling --
   EDA 5.2 showed skew in the tens to hundreds, where mean/sd scaling is dominated
@@ -197,9 +206,9 @@ class NeuralModel(BaseModel):
 
     def __init__(self, arch: str = "mlp", epochs: int = 30, batch_size: int = 4096,
                  lr: float = 2e-3, weight_decay: float = 1e-5, dropout: float = 0.15,
-                 patience: int = 5, loss: str = "l1_log", seq_len: int = 96,
+                 patience: int = 8, loss: str = "l1_log", seq_len: int = 96,
                  seq_stride: int = 3, amp: bool = True, num_workers: int = 0,
-                 **arch_kw):
+                 residual_on_persistence: bool = True, **arch_kw):
         super().__init__()
         self.arch = arch
         self.epochs = epochs
@@ -213,6 +222,8 @@ class NeuralModel(BaseModel):
         self.seq_stride = seq_stride
         self.amp = amp
         self.num_workers = num_workers
+        self.residual_on_persistence = residual_on_persistence
+        self.base_col_: int | None = None
         self.arch_kw = arch_kw
         self.seq_source: SequenceSource | None = None
         self.seq_rows_train: np.ndarray | None = None
@@ -242,6 +253,19 @@ class NeuralModel(BaseModel):
             Xn = self.imputer.transform(Xn)
         return self.scaler.transform(Xn)
 
+    def _baseline(self, X) -> np.ndarray:
+        """log of the current glucose -- the persistence anchor the net corrects.
+
+        Read from the RAW feature matrix, before imputation and scaling. `cgm_now`
+        is never NaN at an anchor (build_dataset requires a real reading there), but
+        the clip is kept as a guard against a caller passing a looser matrix.
+        """
+        if not self.residual_on_persistence or self.base_col_ is None:
+            return np.zeros(len(X), dtype=np.float32)
+        v = np.asarray(X[:, self.base_col_], dtype=np.float64)
+        v = np.where(np.isfinite(v) & (v > 1.0), v, 100.0)
+        return np.log(v).astype(np.float32)
+
     def _loss_fn(self, torch):
         if self.loss_name == "l1_log":
             return lambda p, t: (p - t).abs().mean()          # t already log-space
@@ -265,13 +289,19 @@ class NeuralModel(BaseModel):
         if is_seq and self.seq_source is None:
             raise RuntimeError(f"arch={self.arch!r} needs attach_sequences() first")
 
+        if self.residual_on_persistence and ctx and "cgm_now" in ctx.feature_names:
+            self.base_col_ = ctx.feature_names.index("cgm_now")
+
+        base_tr = self._baseline(X)
         Xtr = self._prep_x(X, fit=True)
-        ytr = np.log(np.clip(np.asarray(y, dtype=np.float32), 1.0, None))
+        # the network learns the log-RATIO; adding base_tr back recovers the level
+        ytr = np.log(np.clip(np.asarray(y, dtype=np.float32), 1.0, None)) - base_tr
         n_tr = len(Xtr)
         has_val = X_val is not None and len(X_val) > 0
         if has_val:
+            base_va = self._baseline(X_val)
             Xva = self._prep_x(X_val, fit=False)
-            yva = np.log(np.clip(np.asarray(y_val, dtype=np.float32), 1.0, None))
+            yva = np.log(np.clip(np.asarray(y_val, dtype=np.float32), 1.0, None)) - base_va
 
         mods = build_modules()
         d_in = Xtr.shape[1]
@@ -323,8 +353,9 @@ class NeuralModel(BaseModel):
             if has_val:
                 vp = self._raw_predict(net, Xva, dev, is_seq, rows=self.seq_rows_val)
                 # report in the metric that matters, not in log-loss units
-                row["val_MARD"] = float(np.mean(np.abs(np.exp(vp) - np.exp(yva))
-                                                / np.exp(yva)) * 100)
+                p_abs = np.exp(np.clip(vp + base_va, 0.0, 7.0))
+                t_abs = np.exp(yva + base_va)
+                row["val_MARD"] = float(np.mean(np.abs(p_abs - t_abs) / t_abs) * 100)
                 score = row["val_MARD"]
                 if score < best - 1e-4:
                     best, bad = score, 0
@@ -342,7 +373,9 @@ class NeuralModel(BaseModel):
         self.dev_ = dev
         self.is_seq_ = is_seq
         self.notes = {
-            "arch": self.arch, "loss": self.loss_name, "target": "log(glucose)",
+            "arch": self.arch, "loss": self.loss_name,
+            "target": ("log(glucose_t+h) - log(glucose_t)  [residual on persistence]"
+                       if self.residual_on_persistence else "log(glucose_t+h)"),
             "epochs_run": len(history), "best_val_MARD": (None if not has_val else best),
             "device": str(dev), "params": int(sum(p.numel() for p in net.parameters())),
             "seq_len": self.seq_len if is_seq else None,
@@ -378,6 +411,7 @@ class NeuralModel(BaseModel):
 
     def predict(self, X, rows: np.ndarray | None = None) -> np.ndarray:
         """`rows` = absolute anchor row indices, required for sequence archs."""
+        base = self._baseline(X)
         Xn = self._prep_x(X, fit=False)
         raw = self._raw_predict(self.net_, Xn, self.dev_, self.is_seq_, rows=rows)
-        return np.exp(np.clip(raw, 0.0, 7.0)).astype(np.float32)
+        return np.exp(np.clip(raw + base, 0.0, 7.0)).astype(np.float32)

@@ -180,14 +180,19 @@ class CatBoostModel(_LogTargetMixin, BaseModel):
         return self
 
     @staticmethod
-    def _prep(X: np.ndarray, cat_idx: list[int]) -> np.ndarray:
+    def _prep(X: np.ndarray, cat_idx: list[int]):
+        """CatBoost refuses a pure-float array when `cat_features` is non-empty, so
+        hand it a DataFrame whose categorical columns are strings. NaN codes become
+        the literal token "-1", which CatBoost then treats as its own level -- the
+        right semantics here, since a missing modality/gender is informative."""
         if not cat_idx:
             return X
-        X = X.copy()
+        import pandas as pd
+        frame = pd.DataFrame(np.asarray(X))
         for j in cat_idx:
-            col = X[:, j]
-            X[:, j] = np.where(np.isfinite(col), col, -1)
-        return X
+            col = frame[j].to_numpy()
+            frame[j] = np.where(np.isfinite(col), col, -1).astype(np.int64).astype(str)
+        return frame
 
     def predict(self, X) -> np.ndarray:
         Xp = self._prep(np.asarray(X), self.cat_idx_)
@@ -263,9 +268,15 @@ class HistGBModel(_LogTargetMixin, BaseModel):
     handles_nan = True
     supports_early_stopping = True
 
-    DEFAULTS = dict(max_iter=1500, max_leaf_nodes=63, learning_rate=0.05,
+    # `early_stopping=False` on purpose. sklearn's built-in early stopping carves a
+    # RANDOM ROW validation slice, which on this corpus puts a subject's 10:00 and
+    # 10:05 samples on opposite sides -- r ~ 0.99, i.e. the exact leakage the rest of
+    # the pipeline forbids (EDA 11). sklearn cannot accept an external eval set, so
+    # this model runs a fixed budget instead and the honest val score comes from the
+    # caller's subject-disjoint split.
+    DEFAULTS = dict(max_iter=600, max_leaf_nodes=63, learning_rate=0.06,
                     min_samples_leaf=64, l2_regularization=1.0,
-                    early_stopping=True, n_iter_no_change=50, validation_fraction=0.1)
+                    early_stopping=False)
 
     def __init__(self, objective: str = "mard", **params):
         super().__init__(**params)
@@ -280,8 +291,14 @@ class HistGBModel(_LogTargetMixin, BaseModel):
             loss=loss, random_state=ctx.seed if ctx else 0,
             categorical_features=(ctx.categorical_idx if ctx else None), **p)
         self.model_.fit(np.asarray(X), self._fwd(y))
+        val_mard = None
+        if X_val is not None and len(X_val):
+            pv = self.predict(X_val)
+            val_mard = float(np.mean(np.abs(pv - y_val) / np.clip(y_val, 1, None)) * 100)
         self.notes = {"loss": loss, "log_target": self.log_target,
-                      "n_iter": int(self.model_.n_iter_), "nan_handling": "native"}
+                      "n_iter": int(self.model_.n_iter_),
+                      "early_stopping": "disabled (would split by row); fixed budget",
+                      "val_MARD": val_mard, "nan_handling": "native"}
         return self
 
     def predict(self, X) -> np.ndarray:

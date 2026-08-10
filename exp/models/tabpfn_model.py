@@ -115,13 +115,22 @@ class TabPFNModel(BaseModel):
         }
         return self
 
-    def predict(self, X) -> np.ndarray:
+    def predict(self, X, chunk: int = 10_000) -> np.ndarray:
+        """Chunked because TabPFN attends every query row against the whole context:
+        peak memory is O(chunk x context x n_estimators). At chunk=50,000 this
+        reached 31 GB on a 32 GB V100; 10,000 keeps it comfortable."""
+        import gc
         Xs = np.asarray(X[:, self.keep_], dtype=np.float32)
         acc = np.zeros(len(Xs), dtype=np.float64)
-        chunk = 50_000
         for m in self.models_:
             for i in range(0, len(Xs), chunk):
                 acc[i:i + chunk] += m.predict(Xs[i:i + chunk])
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:                                    # noqa: BLE001
+                pass
+            gc.collect()
         return self._inv(acc / len(self.models_)).astype(np.float32)
 
     def subsample_eval(self, n_rows: int, seed: int = 0) -> np.ndarray | None:
