@@ -3,186 +3,180 @@ error-grid metric.
 
 Reference
 ---------
-Klonoff DC, Freckmann G, Pleus S, Kovatchev BP, Kerr D, et al.
-"The Diabetes Technology Society Error Grid and Trend Accuracy Matrix for Glucose
-Monitors." *Journal of Diabetes Science and Technology* 2024;18(6):1346-1361.
-DOI 10.1177/19322968241275701 · PMID 39369312 · PMC11531029
-Official tool: https://www.diabetestechnology.org/dtseg/
+Klonoff DC, Freckmann G, Pleus S, Kovatchev BP, Kerr D, et al. "The Diabetes
+Technology Society Error Grid and Trend Accuracy Matrix for Glucose Monitors."
+*J Diabetes Sci Technol* 2024;18(6):1346-1361. DOI 10.1177/19322968241275701 ·
+PMID 39369312 · PMC11531029 · tool <https://www.diabetestechnology.org/dtseg/>
 
-What the paper establishes
---------------------------
-* Five risk zones **A-E** with **straight-line borders**, identical for BGMs and CGMs.
-* The zones are contours of a continuous risk surface fitted to the older
-  Surveillance Error Grid, thresholded at risk scores **0-0.5 (A), >0.5-1.5 (B),
-  >1.5-2.5 (C), >2.5-3.5 (D), >3.5 (E)**.
-* The surface is deliberately **asymmetric**: a monitor reading *above* the reference
-  is scored riskier than the same error below it, because over-reading drives
-  over-dosing and then hypoglycaemia. So the borders above the identity line sit
-  closer to it than the borders below.
-* **The grid is not trademarked and is in the public domain.**
-* The exact border coordinates live in **Supplemental Appendix 2** of the paper.
+The boundaries below are transcribed from the organisers' own scorer,
+`toolkit/metrics.py::calculate_dts_error_grid`, vendored in this repo from
+<https://github.com/replicahealth/glucose-prediction-submission-toolkit>. They are
+straight lines, exactly as the paper describes, so no risk-surface lookup is needed.
+The grid is public domain.
 
-Why the coordinates are not hard-coded here
--------------------------------------------
-Supplemental Appendix 2 is not reachable without a subscription or an interactive
-browser session: the SAGE copy is paywalled (HTTP 403), the PMC copy is behind a
-proof-of-work bot challenge, the article is not in the PMC/Europe-PMC open-access
-subset, and the official tool is a server-side Shiny app. Rather than invent
-plausible-looking numbers — which would produce a metric that *looks* official and
-silently is not — the boundary table is loaded from a data file you supply once.
+Geometry
+--------
+Four borders on each side of the identity line, each a horizontal segment followed
+by a ray. `ref` is the reference (true) glucose, `pred` the monitor/predicted value,
+both mg/dL.
 
-Because the borders are straight lines, supplying them is purely mechanical: the
-same piecewise-linear machinery that implements Parkes in `metrics.py` evaluates
-them unchanged.
+    upper (pred above ref -- the riskier side, so these sit closer to the diagonal)
+      A|B   60    for ref <= 50,  else (540/450)  *(ref - 50)   + 60
+      B|C   86.5  for ref <= 50,  else (513.5/297)*(ref - 50)   + 86.5
+      C|D   124   for ref <= 50,  else (476/191)  *(ref - 50)   + 124
+      D|E   179   for ref <= 50,  else (421/117)  *(ref - 50)   + 179
 
-How to enable it (one-time, ~5 minutes)
----------------------------------------
-1. Open the paper and download Supplemental Appendix 2:
-   https://journals.sagepub.com/doi/suppl/10.1177/19322968241275701
-   (or https://pmc.ncbi.nlm.nih.gov/articles/PMC11531029/ → Supplementary Materials,
-   file ``sj-docx-1-dst-10.1177_19322968241275701.docx``)
-2. Copy the vertex table into ``exp/dts_boundaries.json`` following
-   ``exp/dts_boundaries.template.json``. Coordinates are ``[reference, monitor]``
-   pairs in **mg/dL**, listed left to right along each border.
-3. Nothing else changes. ``metrics.evaluate()`` picks the file up automatically and
-   starts reporting ``dts_A`` … ``dts_E`` alongside Clarke and Parkes.
+    lower (pred below ref)
+      A|B   0     for ref <= 62.5, else (430/537.5)*(ref - 62.5) + 50
+      B|C   0     for ref <= 97.5, else (257/502.5)*(ref - 97.5) + 50
+      C|D   0     for ref <= 153,  else (147/447)  *(ref - 153)  + 50
+      D|E   0     for ref <= 238,  else (76/362)   *(ref - 238)  + 50
 
-Verify before trusting it: plot a grid of (ref, pred) pairs against the official
-tool at https://www.diabetestechnology.org/dtseg/ and confirm the zone letters agree.
-``python -m exp.dts_grid --selftest`` prints a comparison table for exactly that.
+The step from 0 to 50 on the lower borders is not a discontinuity in the grid; it is
+how a **vertical** border segment appears when the border is written as a function of
+`ref`. Below the knee there is simply no lower bound for that zone.
+
+Note the asymmetry: at ref = 100 the A|B border sits at 120 above (a +20 % error) but
+at 80 below (a −20 % error) — and the upper borders tighten faster as glucose falls,
+because over-reading at a low drives over-dosing and then hypoglycaemia.
+
+`--selftest` proves this module agrees exactly with the vendored official scorer.
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import numpy as np
 
-DEFAULT_PATH = Path(__file__).resolve().parent / "dts_boundaries.json"
-
-#: Borders, ordered outward from the identity line. "upper" = monitor above
-#: reference (the riskier side); "lower" = monitor below reference.
-BORDER_ORDER = ("AB", "BC", "CD", "DE")
-ZONE_FOR_BORDER = {"AB": "B", "BC": "C", "CD": "D", "DE": "E"}
+ZONES = ("A", "B", "C", "D", "E")
 
 
-class DTSBoundariesUnavailable(RuntimeError):
-    """Raised when the DTS coordinate file has not been supplied."""
+def _borders(ref: np.ndarray) -> tuple[np.ndarray, ...]:
+    """The eight border values at each reference glucose."""
+    ab_up = np.where(ref <= 50, 60.0, (540.0 / 450.0) * (ref - 50) + 60.0)
+    bc_up = np.where(ref <= 50, 86.5, (513.5 / 297.0) * (ref - 50) + 86.5)
+    cd_up = np.where(ref <= 50, 124.0, (476.0 / 191.0) * (ref - 50) + 124.0)
+    de_up = np.where(ref <= 50, 179.0, (421.0 / 117.0) * (ref - 50) + 179.0)
+
+    ab_lo = np.where(ref <= 62.5, 0.0, (430.0 / 537.5) * (ref - 62.5) + 50.0)
+    bc_lo = np.where(ref <= 97.5, 0.0, (257.0 / 502.5) * (ref - 97.5) + 50.0)
+    cd_lo = np.where(ref <= 153.0, 0.0, (147.0 / 447.0) * (ref - 153.0) + 50.0)
+    de_lo = np.where(ref <= 238.0, 0.0, (76.0 / 362.0) * (ref - 238.0) + 50.0)
+    return ab_up, bc_up, cd_up, de_up, ab_lo, bc_lo, cd_lo, de_lo
 
 
-def _piecewise(vertices, x, side: str) -> np.ndarray:
-    """Monitor-glucose value of a straight-line border at reference value `x`.
-
-    Beyond the last vertex an upper border returns +inf and a lower border -inf:
-    the border has left the grid there, so nothing can be outside it.
-    """
-    vx = np.asarray([v[0] for v in vertices], dtype=np.float64)
-    vy = np.asarray([v[1] for v in vertices], dtype=np.float64)
-    order = np.argsort(vx)
-    vx, vy = vx[order], vy[order]
-    if side == "upper":
-        return np.interp(x, vx, vy, left=vy[0], right=np.inf)
-    return np.interp(x, vx, vy, left=-np.inf, right=vy[-1])
-
-
-def load_boundaries(path: Path | str | None = None) -> dict:
-    """Load and validate the boundary table."""
-    p = Path(path) if path is not None else DEFAULT_PATH
-    if not p.exists():
-        raise DTSBoundariesUnavailable(
-            f"DTS Error Grid boundary file not found at {p}.\n"
-            "The exact border coordinates are in Supplemental Appendix 2 of\n"
-            "  Klonoff et al. 2024, JDST 18(6):1346-1361, DOI 10.1177/19322968241275701\n"
-            "  https://journals.sagepub.com/doi/suppl/10.1177/19322968241275701\n"
-            f"Copy them into {p} using the schema in "
-            f"{DEFAULT_PATH.with_name('dts_boundaries.template.json').name}.\n"
-            "Until then, use parkes_zones() -- the closest published relative -- and do "
-            "not report a number as 'DTS zone A'."
-        )
-    spec = json.loads(p.read_text())
-    for side in ("upper", "lower"):
-        if side not in spec:
-            raise ValueError(f"{p}: missing '{side}' section")
-        for b in BORDER_ORDER:
-            if b not in spec[side]:
-                continue                      # a border may legitimately not exist
-            verts = spec[side][b]
-            if len(verts) < 2:
-                raise ValueError(f"{p}: {side}.{b} needs at least 2 vertices")
-            for v in verts:
-                if len(v) != 2:
-                    raise ValueError(f"{p}: {side}.{b} vertex {v} is not [ref, monitor]")
-    return spec
-
-
-def dts_zones(y_true, y_pred, boundaries: dict | None = None,
-              path: Path | str | None = None) -> np.ndarray:
-    """DTS Error Grid zone per point as 'A'..'E' ('?' where either value is not finite).
-
-    `y_true` is the reference glucose, `y_pred` the monitor/predicted value, both
-    mg/dL. Raises `DTSBoundariesUnavailable` if the coordinate file is absent.
-    """
-    spec = boundaries if boundaries is not None else load_boundaries(path)
+def dts_zones(y_true, y_pred) -> np.ndarray:
+    """DTS Error Grid zone per point as 'A'..'E', or '?' where either value is
+    non-finite. `y_true` is the reference, `y_pred` the prediction, both mg/dL."""
     ref = np.asarray(y_true, dtype=np.float64)
     pred = np.asarray(y_pred, dtype=np.float64)
-    zone = np.full(ref.shape, "A", dtype="<U1")
+    ab_up, bc_up, cd_up, de_up, ab_lo, bc_lo, cd_lo, de_lo = _borders(ref)
 
-    above = pred >= ref
-    for border in BORDER_ORDER:
-        letter = ZONE_FOR_BORDER[border]
-        if border in spec.get("upper", {}):
-            out = above & (pred > _piecewise(spec["upper"][border], ref, "upper"))
-            zone[out] = letter
-        if border in spec.get("lower", {}):
-            out = (~above) & (pred < _piecewise(spec["lower"][border], ref, "lower"))
-            zone[out] = letter
+    zone = np.full(ref.shape, "E", dtype="<U1")          # outside every border
+    zone[((pred <= de_up) & (pred > cd_up)) | ((pred < cd_lo) & (pred >= de_lo))] = "D"
+    zone[((pred <= cd_up) & (pred > bc_up)) | ((pred < bc_lo) & (pred >= cd_lo))] = "C"
+    zone[((pred <= bc_up) & (pred > ab_up)) | ((pred < ab_lo) & (pred >= bc_lo))] = "B"
+    zone[(pred <= ab_up) & (pred >= ab_lo)] = "A"
 
     zone[~np.isfinite(ref) | ~np.isfinite(pred)] = "?"
     return zone
 
 
-def available(path: Path | str | None = None) -> bool:
-    p = Path(path) if path is not None else DEFAULT_PATH
-    return p.exists()
+def dts_fractions(y_true, y_pred) -> dict[str, float]:
+    """Percentage of finite points in each zone, plus the A+B total."""
+    z = dts_zones(y_true, y_pred)
+    valid = z[z != "?"]
+    n = max(len(valid), 1)
+    out = {f"dts_{k}": float((valid == k).sum()) / n * 100.0 for k in ZONES}
+    out["dts_AB"] = out["dts_A"] + out["dts_B"]
+    return out
+
+
+def available(*_a, **_kw) -> bool:
+    """Kept for API stability: the grid is now always available."""
+    return True
 
 
 # ------------------------------------------------------------------- self-test
 def _selftest() -> int:
-    """Print zone assignments for a spread of points, to diff against the official
-    tool at https://www.diabetestechnology.org/dtseg/."""
-    try:
-        spec = load_boundaries()
-    except DTSBoundariesUnavailable as e:
-        print(e)
+    """Assert exact agreement with the organisers' vendored scorer."""
+    import importlib.util
+    from pathlib import Path
+
+    official_path = Path(__file__).resolve().parent.parent / "toolkit" / "metrics.py"
+    if not official_path.exists():
+        print(f"official scorer not found at {official_path} -- cannot cross-check.\n"
+              "Vendor it from "
+              "https://github.com/replicahealth/glucose-prediction-submission-toolkit")
         return 1
+    spec = importlib.util.spec_from_file_location("official_metrics", official_path)
+    official = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(official)
 
-    print(f"loaded {DEFAULT_PATH}")
-    for side in ("upper", "lower"):
-        for b in BORDER_ORDER:
-            if b in spec.get(side, {}):
-                print(f"  {side:5s} {b}: {len(spec[side][b])} vertices "
-                      f"{spec[side][b][0]} … {spec[side][b][-1]}")
+    rng = np.random.default_rng(0)
+    fails = 0
+    for name, ref, pred in [
+        ("uniform",   rng.uniform(20, 450, 200_000), rng.uniform(20, 450, 200_000)),
+        ("realistic", (r := rng.uniform(40, 400, 200_000)),
+                      np.clip(r * rng.normal(1.0, 0.18, 200_000), 5, 600)),
+        ("hypo",      rng.uniform(30, 80, 100_000),  rng.uniform(20, 250, 100_000)),
+        ("perfect",   (g := np.linspace(20, 450, 50_000)), g.copy()),
+        ("edges",     np.repeat([50.0, 62.5, 97.5, 153.0, 238.0], 4000),
+                      np.tile(np.linspace(0, 600, 4000), 5)),
+    ]:
+        # Compare the raw percentages, NOT the official function's 2-dp rounded
+        # output: at an exact half (e.g. 19.265) Python's round and numpy's round
+        # break the tie differently, which looks like a mismatch while the
+        # classification is identical. The counts are what must agree.
+        mine = dts_fractions(ref, pred)
+        theirs = official.calculate_dts_error_grid(pred, ref)
+        row = []
+        for z in ZONES:
+            a = mine[f"dts_{z}"]
+            b = theirs[f"DTS_{z}_ZONE_PERCENT"]
+            # b is rounded to 2 dp by the official code, so allow half a unit there
+            ok = abs(a - b) <= 0.005 + 1e-9
+            fails += (not ok)
+            row.append(f"{z}={a:6.2f}/{b:6.2f}{'' if ok else ' MISMATCH'}")
+        print(f"  {name:<10} n={len(ref):>7,}  " + "  ".join(row))
 
-    refs = [40, 60, 70, 100, 140, 180, 250, 300, 400]
-    rels = [-0.60, -0.40, -0.20, -0.10, 0.0, 0.10, 0.20, 0.40, 0.60]
-    print("\nzone by reference (rows) x relative error (cols)")
-    print("ref  " + "".join(f"{int(r*100):>+6d}%" for r in rels))
-    for r in refs:
-        preds = np.array([r * (1 + q) for q in rels])
-        z = dts_zones(np.full(len(preds), float(r)), preds, spec)
-        print(f"{r:>4} " + "".join(f"{c:>7}" for c in z))
 
-    # sanity invariants that must hold for any correct table
-    g = np.linspace(20, 400, 400)
-    same = dts_zones(g, g, spec)
-    bad = int((same != "A").sum())
-    print(f"\nperfect predictions in zone A: {len(g)-bad}/{len(g)}"
-          f"{'  <-- FAIL' if bad else '  ok'}")
-    hi = dts_zones(np.full(200, 70.0), np.linspace(70, 400, 200), spec)
-    monotone = all(hi[i] <= hi[i + 1] for i in range(len(hi) - 1))
-    print(f"zones worsen monotonically as the error grows: {monotone}"
-          f"{'' if monotone else '  <-- FAIL'}")
-    return 0 if (bad == 0 and monotone) else 1
+    # Exact per-point equivalence. Calling the official function one point at a time
+    # makes its output unambiguous (a single point is 0 % or 100 % of a zone, which
+    # survives the 2-dp rounding), so this compares classifications, not percentages.
+    n_pt = 4000
+    r1 = np.concatenate([rng.uniform(20, 450, n_pt // 2),
+                         rng.choice([50.0, 62.5, 97.5, 153.0, 238.0], n_pt // 2)])
+    p1 = np.concatenate([rng.uniform(5, 600, n_pt // 2),
+                         r1[n_pt // 2:] * rng.uniform(0.2, 3.0, n_pt // 2)])
+    mine_pt = dts_zones(r1, p1)
+    bad = 0
+    for i in range(len(r1)):
+        d = official.calculate_dts_error_grid([p1[i]], [r1[i]])
+        theirs_z = next(z for z in ZONES if d[f"DTS_{z}_ZONE_PERCENT"] == 100.0)
+        if theirs_z != mine_pt[i]:
+            bad += 1
+            if bad <= 3:
+                print(f"    point mismatch ref={r1[i]:.4f} pred={p1[i]:.4f} "
+                      f"mine={mine_pt[i]} official={theirs_z}")
+    print(f"\n  exact per-point agreement: {len(r1)-bad}/{len(r1)}"
+          f"{'' if bad == 0 else '  <-- FAIL'}")
+    fails += (bad > 0)
+
+    perfect = dts_zones(np.linspace(20, 450, 5000), np.linspace(20, 450, 5000))
+    all_a = bool((perfect == "A").all())
+    print(f"  perfect predictions all in zone A: {all_a}")
+    fails += (not all_a)
+
+    print("\n  zone by reference (rows) x relative error (cols)")
+    rels = [-0.6, -0.4, -0.2, -0.1, 0.0, 0.1, 0.2, 0.4, 0.6]
+    print("  ref  " + "".join(f"{int(q*100):>+7d}%" for q in rels))
+    for r in [40, 60, 70, 100, 140, 180, 250, 300, 400]:
+        p = np.array([r * (1 + q) for q in rels])
+        z = dts_zones(np.full(len(p), float(r)), p)
+        print(f"  {r:>4} " + "".join(f"{c:>8}" for c in z))
+
+    print("\n" + ("ALL CHECKS PASSED -- matches the official scorer exactly"
+                  if fails == 0 else f"{fails} MISMATCHES"))
+    return 0 if fails == 0 else 1
 
 
 if __name__ == "__main__":
@@ -190,6 +184,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--selftest", action="store_true",
-                    help="print a zone table to diff against the official tool")
+                    help="verify against toolkit/metrics.py, the official scorer")
     a = ap.parse_args()
-    raise SystemExit(_selftest() if a.selftest else print(__doc__) or 0)
+    raise SystemExit(_selftest() if a.selftest else (print(__doc__) or 0))

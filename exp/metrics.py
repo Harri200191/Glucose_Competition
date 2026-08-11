@@ -3,24 +3,19 @@
 The competition scores **MARD** and **error-grid A-zone %** as two independent
 tracks, with RMSE only breaking ties (README).
 
-Which grid is official
-----------------------
-The competition scores the **DTS Error Grid** (Klonoff et al. 2024, JDST
-18(6):1346-1361, DOI 10.1177/19322968241275701). Its five zones have straight-line
-borders whose exact coordinates are published in Supplemental Appendix 2 of that
-paper. `exp/dts_grid.py` implements the grid; it reads those coordinates from
-`exp/dts_boundaries.json`, which you supply once (see that module's docstring --
-it is a copy-paste job, no code changes). The grid is public domain.
+Grids
+-----
+* **DTS** (`exp/dts_grid.py`) -- the competition's official error grid, Klonoff et
+  al. 2024. Its boundaries are transcribed from the organisers' own scorer, vendored
+  at `toolkit/metrics.py`, and `python -m exp.dts_grid --selftest` proves exact
+  agreement point-for-point. **This is the number to report.**
+* **Clarke** -- the classical formulation, kept as a familiar cross-check.
+* **Parkes / Consensus** Type 1 -- Pfützner et al. (2013), the closest published
+  relative of the DTS grid.
 
-**Until that file exists, `evaluate()` reports no DTS columns at all** rather than
-substituting a lookalike. Two published relatives are always computed:
-
-  * **Clarke** -- the classical formulation, unambiguous and widely reimplemented;
-  * **Parkes / Consensus** Type 1 -- from the boundary vertices in Pfützner et al.
-    (2013). The closest relative of the DTS grid, and like it asymmetric about the
-    identity line.
-
-Use those for model selection. Do not report either as a DTS number.
+All three are computed on every run. `MARD` here matches the official
+`toolkit/metrics.py::calculate_mard` (the only difference is that this one does not
+round to 2 dp).
 """
 from __future__ import annotations
 
@@ -193,15 +188,10 @@ def evaluate(y_true, y_pred) -> dict[str, float]:
     pk = zone_fractions(parkes_zones(t, p))
     res.update({f"parkes_{k[5:]}": v for k, v in pk.items()})
 
-    # The official grid, only if its coordinates have been supplied. Absent columns
-    # are the honest signal that this run was not scored on the official metric.
-    try:
-        from . import dts_grid
-        if dts_grid.available():
-            dz = zone_fractions(dts_grid.dts_zones(t, p))
-            res.update({f"dts_{k[5:]}": v for k, v in dz.items()})
-    except Exception as e:                                       # noqa: BLE001
-        res["dts_error"] = f"{type(e).__name__}: {e}"
+    # The official grid. Verified to match toolkit/metrics.py exactly
+    # (`python -m exp.dts_grid --selftest`).
+    from .dts_grid import dts_fractions
+    res.update(dts_fractions(t, p))
     return res
 
 

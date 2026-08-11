@@ -428,52 +428,58 @@ the script exited 1.
 
 ---
 
-## 8 · Enabling the official DTS error grid
+## 8 · Official scoring
 
-The competition's error-grid track uses the **DTS Error Grid** (Klonoff et al. 2024,
-JDST 18(6):1346–1361, DOI [10.1177/19322968241275701](https://doi.org/10.1177/19322968241275701)).
-It is fully implemented in `exp/dts_grid.py` but needs its border coordinates, which
-are published only in Supplemental Appendix 2 of that paper and are not machine-
-retrievable (SAGE 403s, PMC has a bot challenge, the article is not open-access).
+The competition's own scorer is vendored at **`toolkit/`** (from
+[replicahealth/glucose-prediction-submission-toolkit](https://github.com/replicahealth/glucose-prediction-submission-toolkit),
+LFS data included). Nothing to configure — `exp/metrics.py` reproduces it and every
+run already reports `dts_A` … `dts_E`.
 
-One-time, about five minutes:
+Confirm the equivalence any time:
 
 ```bash
-# 1. download Supplemental Appendix 2 in a browser
-#    https://journals.sagepub.com/doi/suppl/10.1177/19322968241275701
-#    or PMC11531029 -> Supplementary Materials -> sj-docx-1-dst-...docx
-
-# 2. transcribe the vertex table
-cp exp/dts_boundaries.template.json exp/dts_boundaries.json
-$EDITOR exp/dts_boundaries.json     # [reference, monitor] pairs in mg/dL
-
-# 3. verify against the official tool
 $PY -m exp.dts_grid --selftest
 ```
 
-`--selftest` prints a zone table across reference × relative error to diff against
-<https://www.diabetestechnology.org/dtseg/>, and checks two invariants: perfect
-predictions must all land in zone A, and zones must worsen monotonically as the error
-grows.
+It cross-checks `exp/dts_grid.py` against `toolkit/metrics.py` on five bulk datasets
+plus 4000 exact per-point comparisons, half of them placed on the border knees. MARD
+and RMSE were verified the same way.
 
-Once `exp/dts_boundaries.json` exists, every run automatically gains `dts_A` …
-`dts_E` and `dts_AB` columns — no other change, and no need to re-run the dataset
-build. Re-score existing runs with:
+**Horizons.** The toolkit accepts `pred_30`, `pred_60`, `pred_90`, `pred_120` and the
+live leaderboard **defaults to the 60-minute horizon** (`--horizon` also takes 30, 90,
+120 or `all`). If you are optimising for the leaderboard, 60 min is the one that
+counts — not 30.
+
+Validate a submission end-to-end with the real scorer:
 
 ```bash
-$PY -c "from exp.run_all import collect; collect()"
+cd toolkit && $PY run.py ../runs/submission.parquet --competition live --horizon all
 ```
 
-**Until then, no `dts_*` column is emitted at all.** That absence is deliberate: a
-missing column is an honest signal that the run was not scored on the official
-metric, whereas a lookalike number would quietly be wrong. `Clarke` and `Parkes` are
-always reported and are fine for ranking models against each other — just don't
-report them as DTS figures.
+### Re-scoring without retraining
+
+Every run stores `predictions.npy` and `test_index.npy`, so a metric change never
+costs a retrain:
+
+```bash
+$PY -m exp.rescore --data build/main
+```
+
+This recomputes all metric blocks in place, keeps the old ones under
+`result.json → previous_test`, and regenerates `runs/results.csv`.
 
 ---
 
 ## 9 · Before you submit anything
 
-Confirm `dts_*` columns are present in `runs/results.csv` (i.e. §8 is done), and
-sanity-check a handful of predictions against the official tool. The Clarke and
-Parkes numbers are proxies and should not appear in a submission writeup.
+1. `$PY -m exp.dts_grid --selftest` — confirms the local scorer still matches
+   `toolkit/`.
+2. Rank on **`dts_A`** and **`MARD`** at the **60-minute** horizon; that is what the
+   live leaderboard defaults to. `clarke_A` / `parkes_A` are cross-checks and should
+   not appear in a writeup.
+3. Build the submission in exact template row order, then validate with the real
+   scorer: `cd toolkit && $PY run.py ../runs/submission.parquet --competition live
+   --horizon all`.
+4. Submission rules that bite (from `toolkit/README.md`): all four `pred_*` columns
+   must exist; each populated column must have **no NaN**; any horizon you skip must
+   be **entirely** NaN. Partially-filled columns are rejected.

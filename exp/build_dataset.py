@@ -165,12 +165,8 @@ def build(out_dir: Path, cfg: ExperimentConfig, limit_subjects: int | None = Non
     #   bolus/basal/carbs : log1p(x)         (tames the spike-train tails, EDA 5.4)
     if emit_channels:
         t0 = time.time()
-        ch = np.zeros((n, 5), dtype=np.float32)
-        ch[:, 0] = np.nan_to_num(cgm_f / 100.0 - 1.5, nan=0.0)
-        ch[:, 1] = real.astype(np.float32)
-        ch[:, 2] = np.log1p(np.nan_to_num(df["bolus"].to_numpy(dtype=np.float64)))
-        ch[:, 3] = np.log1p(np.nan_to_num(df["basal"].to_numpy(dtype=np.float64)))
-        ch[:, 4] = np.log1p(np.nan_to_num(df["carbs"].to_numpy(dtype=np.float64)))
+        from .features import build_channels
+        ch = build_channels(df, cgm_f, real)
         np.save(out_dir / "channels.npy", ch)
         stats["channels_gb"] = round(ch.nbytes / 1e9, 3)
         log(f"[channels] {time.time()-t0:.1f}s  {ch.shape} ({ch.nbytes/1e9:.2f} GB)")

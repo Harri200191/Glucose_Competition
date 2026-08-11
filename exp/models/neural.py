@@ -305,8 +305,10 @@ class NeuralModel(BaseModel):
 
         mods = build_modules()
         d_in = Xtr.shape[1]
+        self.d_in_ = int(d_in)
+        self.n_channels_ = int(self.seq_source.channels.shape[1]) if is_seq else 0
         if is_seq:
-            net = mods[self.arch](d_static=d_in, n_channels=self.seq_source.channels.shape[1],
+            net = mods[self.arch](d_static=d_in, n_channels=self.n_channels_,
                                   dropout=self.dropout, **self.arch_kw)
         else:
             net = mods[self.arch](d_in, dropout=self.dropout, **self.arch_kw)
@@ -415,3 +417,60 @@ class NeuralModel(BaseModel):
         Xn = self._prep_x(X, fit=False)
         raw = self._raw_predict(self.net_, Xn, self.dev_, self.is_seq_, rows=rows)
         return np.exp(np.clip(raw + base, 0.0, 7.0)).astype(np.float32)
+
+    # ------------------------------------------------------------- persistence
+    # The architecture classes are defined inside `build_modules()`, so they are
+    # not picklable by reference and plain joblib.dump fails. Save the weights plus
+    # everything needed to rebuild instead -- which is the durable format anyway.
+    def save(self, path) -> None:
+        import torch
+        torch.save({
+            "format": "NeuralModel/1",
+            "arch": self.arch, "arch_kw": self.arch_kw,
+            "hyper": dict(epochs=self.epochs, batch_size=self.batch_size, lr=self.lr,
+                          weight_decay=self.weight_decay, dropout=self.dropout,
+                          patience=self.patience, loss=self.loss_name,
+                          seq_len=self.seq_len, seq_stride=self.seq_stride,
+                          amp=self.amp,
+                          residual_on_persistence=self.residual_on_persistence),
+            "d_in": self.d_in_, "n_channels": self.n_channels_,
+            "is_seq": self.is_seq_, "base_col": self.base_col_,
+            "state_dict": {k: v.detach().cpu() for k, v in self.net_.state_dict().items()},
+            "imputer": {"medians": self.imputer.medians_,
+                        "indicator_cols": self.imputer.indicator_cols_,
+                        "add_indicators": self.imputer.add_indicators},
+            "scaler": {"center": self.scaler.center_, "scale": self.scaler.scale_,
+                       "clip": self.scaler.clip},
+            "notes": self.notes,
+        }, str(path))
+
+    @classmethod
+    def load_checkpoint(cls, path, device: str | None = None) -> "NeuralModel":
+        import torch
+        ck = torch.load(str(path), map_location="cpu", weights_only=False)
+        if ck.get("format") != "NeuralModel/1":
+            raise ValueError(f"{path} is not a NeuralModel checkpoint")
+
+        m = cls(arch=ck["arch"], **ck["hyper"], **ck["arch_kw"])
+        m.d_in_, m.n_channels_ = ck["d_in"], ck["n_channels"]
+        m.is_seq_ = ck["is_seq"]
+        m.base_col_ = ck["base_col"]
+        m.notes = ck.get("notes", {})
+
+        m.imputer = NanImputer(add_indicators=ck["imputer"]["add_indicators"])
+        m.imputer.medians_ = ck["imputer"]["medians"]
+        m.imputer.indicator_cols_ = ck["imputer"]["indicator_cols"]
+        m.scaler = Standardiser(clip=ck["scaler"]["clip"])
+        m.scaler.center_, m.scaler.scale_ = ck["scaler"]["center"], ck["scaler"]["scale"]
+
+        mods = build_modules()
+        if m.is_seq_:
+            net = mods[m.arch](d_static=m.d_in_, n_channels=m.n_channels_,
+                               dropout=m.dropout, **m.arch_kw)
+        else:
+            net = mods[m.arch](m.d_in_, dropout=m.dropout, **m.arch_kw)
+        net.load_state_dict(ck["state_dict"])
+        dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        m.net_ = net.to(dev).eval()
+        m.dev_ = dev
+        return m

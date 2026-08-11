@@ -59,7 +59,7 @@ MAX_GPU_JOBS=0          # 0 = one job per available GPU
 MAX_CPU_JOBS=0          # 0 = auto from core count
 POLL_SEC=10
 
-DO_BUILD=1
+DO_BUILD=0
 DO_RUN=1
 DO_COLLECT=1
 RESUME=0

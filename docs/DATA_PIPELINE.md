@@ -418,68 +418,61 @@ zone fractions.
 Also reported **per subject** (mean, median, p90, worst) and **per cohort**. EDA 8.3:
 `Loop` is 61 % of rows, so a row-weighted score is largely a score on `Loop`.
 
-### 11.1 · The DTS Error Grid — official metric, one manual step
+### 11.1 · The DTS Error Grid — official, implemented, verified
 
 The competition's error-grid track uses the **DTS Error Grid**:
 
 > Klonoff DC, Freckmann G, Pleus S, Kovatchev BP, Kerr D, et al. "The Diabetes
 > Technology Society Error Grid and Trend Accuracy Matrix for Glucose Monitors."
-> *J Diabetes Sci Technol* 2024;18(6):1346–1361.
+> *J Diabetes Sci Technol* 2024;18(6):1346-1361.
 > DOI [10.1177/19322968241275701](https://doi.org/10.1177/19322968241275701) ·
-> PMID 39369312 · PMC11531029 ·
-> tool: <https://www.diabetestechnology.org/dtseg/>
+> PMID 39369312 · tool <https://www.diabetestechnology.org/dtseg/>
 
-What the paper establishes, and what it means for us:
+The paper's Supplemental Appendix 2 holds the border coordinates and is paywalled,
+but they were not needed: the organisers' own scorer is public at
+[replicahealth/glucose-prediction-submission-toolkit](https://github.com/replicahealth/glucose-prediction-submission-toolkit)
+and is **vendored in this repo at `toolkit/`**. `exp/dts_grid.py` transcribes its
+boundaries. The grid is public domain.
 
-| Paper says | Consequence here |
-|---|---|
-| Five zones **A–E** with **straight-line borders** | The same piecewise-linear evaluator that implements Parkes works unchanged — only the vertex table differs |
-| Zones are contours of a fitted risk surface, thresholded at **0–0.5 (A), >0.5–1.5 (B), >1.5–2.5 (C), >2.5–3.5 (D), >3.5 (E)** | We consume the published *borders*, not the surface — the paper already did the thresholding |
-| The surface is **asymmetric**: monitor-above-reference is riskier than the same error below, because over-reading drives over-dosing then hypoglycaemia | The upper borders sit closer to the identity line. Matches the asymmetry Parkes already has, and the 1/t weighting MARD applies |
-| **Not trademarked, public domain** | No licensing obstacle to implementing it |
-| Exact coordinates are in **Supplemental Appendix 2** | The one thing not machine-retrievable — see below |
+**Geometry.** Four straight-line borders each side of the identity line, each a
+horizontal segment then a ray (`ref` = reference glucose, mg/dL):
 
-**Status: implemented, awaiting coordinates.** `exp/dts_grid.py` contains the full
-evaluator. It reads the border vertices from `exp/dts_boundaries.json`, which is a
-copy-paste from Supplemental Appendix 2 — no code changes needed.
-`exp/dts_boundaries.template.json` gives the schema.
+| Border | Above the diagonal | Below the diagonal |
+|---|---|---|
+| A\|B | `60` for ref ≤ 50, else `(540/450)(ref−50)+60` | `0` for ref ≤ 62.5, else `(430/537.5)(ref−62.5)+50` |
+| B\|C | `86.5` for ref ≤ 50, else `(513.5/297)(ref−50)+86.5` | `0` for ref ≤ 97.5, else `(257/502.5)(ref−97.5)+50` |
+| C\|D | `124` for ref ≤ 50, else `(476/191)(ref−50)+124` | `0` for ref ≤ 153, else `(147/447)(ref−153)+50` |
+| D\|E | `179` for ref ≤ 50, else `(421/117)(ref−50)+179` | `0` for ref ≤ 238, else `(76/362)(ref−238)+50` |
 
-Why the numbers are not baked in: Appendix 2 is not reachable programmatically. SAGE
-returns HTTP 403, the PMC copy sits behind a proof-of-work bot challenge, the article
-is in neither the PMC nor Europe-PMC open-access subset, Ovid exposes only the
-abstract, and the official tool is a server-side Shiny app. Inventing
-plausible-looking borders would produce a metric that *looks* official and silently
-is not, so instead:
+The jump from 0 to 50 on the lower borders is not a discontinuity in the grid — it is
+how a **vertical** border segment looks when written as a function of `ref`. Below the
+knee that zone simply has no lower bound.
 
-- **Until `dts_boundaries.json` exists, `evaluate()` emits no `dts_*` columns at
-  all.** A missing column is the honest signal that a run was not scored on the
-  official metric.
-- `dts_zones()` called directly raises `DTSBoundariesUnavailable` with the DOI, the
-  download URL and the target path.
+The grid is **asymmetric by design**: at ref = 100 the A\|B border sits at 120 above
+but 80 below, and the upper borders tighten faster as glucose falls, because
+over-reading at a low drives over-dosing and then hypoglycaemia. This is the same
+direction as the 1/t weighting MARD applies (§9.2), so both official metrics punish
+the hypoglycaemic tail hardest — and it is why every model here trains on log-glucose.
 
-To enable it: download Appendix 2, transcribe the vertices, then
+**Verification.** `python -m exp.dts_grid --selftest` cross-checks against the
+vendored official scorer:
 
-```bash
-python -m exp.dts_grid --selftest
-```
+- five bulk datasets (uniform, realistic, hypo-heavy, perfect, on-the-knee) agree to
+  the official function's 2-dp output;
+- **4000/4000 exact per-point agreement**, half of those points placed deliberately on
+  the border knees (ref ∈ {50, 62.5, 97.5, 153, 238});
+- perfect predictions all land in zone A.
 
-which prints a zone table across reference × relative-error to diff against
-<https://www.diabetestechnology.org/dtseg/>, and asserts two invariants — perfect
-predictions must all be zone A, and zones must worsen monotonically as the error grows.
+`MARD` and `RMSE` were checked the same way and match `toolkit/metrics.py` exactly
+(11.9584 vs 11.96, 36.7027 vs 36.70 on 100k points — the difference is only the
+official function's rounding to 2 dp).
 
-**The evaluator itself is already verified.** Fed the *Parkes* Type 1 vertices, it
-reproduces the hand-written `parkes_zones()` exactly (both 85.96 % zone A on the same
-5,000-point test). So the geometry engine is correct; only the DTS vertex data is
-outstanding.
+### 11.2 · The two cross-checks
 
-### 11.2 · The two proxies, meanwhile
-
-**Clarke** (classical) and **Parkes/Consensus Type 1** (vertices from Pfützner et al.
-2013) are always computed. Clarke was validated against canonical points — exact ±20 %
-zone-A boundary, and the documented A/B/C/D/E cases. Parkes is the closer relative of
-DTS, sharing its asymmetry.
-
-Use them for model selection and ranking. **Do not report either as a DTS number.**
+**Clarke** (classical, validated against canonical points including the exact ±20 %
+zone-A boundary) and **Parkes/Consensus Type 1** (Pfützner et al. 2013) are also
+computed on every run. They are familiar reference points, not the scored metric.
+Report `dts_A`.
 
 ### Training objective
 

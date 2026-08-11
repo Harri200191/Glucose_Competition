@@ -164,11 +164,16 @@ def run(data_dir: Path, model_name: str, horizon: int, split_scheme: str = "offi
         (pd.DataFrame({"feature": names, "importance": imp})
            .sort_values("importance", ascending=False)
            .to_csv(tag / "importance.csv", index=False))
-    if save_model and FAMILY.get(model_name) != "nn":
+    if save_model:
+        # Neural nets write a torch checkpoint (their module classes are defined
+        # inside a factory and are not picklable by reference); everything else
+        # joblib-pickles. `exp.predict_submission` loads either.
+        path = tag / ("model.pt" if FAMILY.get(model_name) == "nn" else "model.joblib")
         try:
-            model.save(tag / "model.joblib")
+            model.save(path)
+            print(f"[saved] {path} ({path.stat().st_size/1e6:.1f} MB)", flush=True)
         except Exception as e:                       # noqa: BLE001
-            print(f"[warn] could not pickle model: {e}", flush=True)
+            print(f"[warn] could not save model: {e}", flush=True)
 
     t = result["test"]
     print(f"\n[{model_name} h={horizon} {split_scheme}]  "

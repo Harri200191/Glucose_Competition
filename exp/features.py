@@ -190,6 +190,29 @@ def feature_plan(fc: FeatureConfig, use_cohort: bool) -> list[tuple[str, str]]:
 
 CATEGORICAL_FEATURES = ("gender", "insulin_delivery_modality", "source_file")
 
+#: Channel order for the sequence models. Must never be reordered -- saved
+#: checkpoints encode it in their first conv/GRU layer.
+CHANNEL_NAMES = ("cgm", "cgm_present", "bolus", "basal", "carbs")
+
+
+def build_channels(df: pd.DataFrame, cgm_f: np.ndarray,
+                   real: np.ndarray) -> np.ndarray:
+    """The full-resolution [n_rows, 5] channel array the sequence models window over.
+
+    Defined here, and called by both `build_dataset` and `predict_submission`, so
+    training and inference cannot drift apart. Transforms are fixed:
+      cgm         cgm_f / 100 - 1.5   (roughly zero-centred)
+      cgm_present 1.0 where the reading is REAL, 0.0 where interpolated or missing
+      bolus/basal/carbs   log1p(x)    (tames the spike-train tails, EDA 5.4)
+    """
+    ch = np.zeros((len(df), len(CHANNEL_NAMES)), dtype=np.float32)
+    ch[:, 0] = np.nan_to_num(cgm_f / 100.0 - 1.5, nan=0.0)
+    ch[:, 1] = real.astype(np.float32)
+    ch[:, 2] = np.log1p(np.nan_to_num(df["bolus"].to_numpy(dtype=np.float64)))
+    ch[:, 3] = np.log1p(np.nan_to_num(df["basal"].to_numpy(dtype=np.float64)))
+    ch[:, 4] = np.log1p(np.nan_to_num(df["carbs"].to_numpy(dtype=np.float64)))
+    return ch
+
 
 def build_feature_matrix(df: pd.DataFrame, seg_id: np.ndarray, cgm_f: np.ndarray,
                          was_interp: np.ndarray, anchor_idx: np.ndarray,
