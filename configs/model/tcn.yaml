@@ -1,0 +1,12 @@
+# TCN backbone. auto_levels sizes the depth so the receptive field covers the
+# configured context; the run manifest records the resulting field.
+include: [base]
+
+model:
+  d_model: 128
+  backbone:
+    name: tcn
+    kernel_size: 3
+    n_levels: 6
+    auto_levels: true
+    dropout: 0.1

@@ -1,0 +1,5 @@
+# E4 -- the core methodological contribution, on Mamba-2:
+#   raw_concat -> concat -> gated -> film, then +event features, +masks.
+# Question: does modality-specific encoding beat naive concatenation, and does
+# CGM-centred conditioning beat generic fusion?
+include: [base, model/mamba2, data/core, fusion/film]

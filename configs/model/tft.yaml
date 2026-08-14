@@ -1,0 +1,24 @@
+# Temporal Fusion Transformer, native form: it brings its own variable selection,
+# so the common fusion module must not be placed in front of it.
+#
+# Variable selection builds one small network per input variable, which is the
+# expensive part at 24 h of context. Shorter default context and a bigger batch
+# keep it comparable in wall-clock terms; report the context you used.
+include: [base]
+
+data:
+  context: 96
+
+model:
+  d_model: 96
+  fusion:
+    name: native
+  backbone:
+    name: tft
+    n_heads: 4
+    dropout: 0.1
+  head:
+    pooling: last
+
+training:
+  lr: 0.0005

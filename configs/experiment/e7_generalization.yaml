@@ -1,0 +1,10 @@
+# E7 -- generalisation and transportability.
+# Novel-patient and known-patient strata come free with the official split; this
+# config exists for the leave-one-source-out arm, where the split scheme changes
+# and holdout_source is set per run by the sweep script.
+include: [base, model/mamba2, fusion/film, data/core]
+
+data:
+  split:
+    scheme: loso
+    holdout_source: OhioT1DM

@@ -1,0 +1,10 @@
+# E3 -- context-length study: 2/4/8/12/24 h for TCN, PatchTST and Mamba-2.
+# Question: does longer history help, and does it help one backbone more?
+# The anchor set is identical at every context (the store guarantees 24 h of
+# history for every anchor), so the only thing changing is what the model sees.
+include: [base, data/core, fusion/raw_concat]
+
+data:
+  context: 96          # overridden by the sweep script
+  sampling:
+    max_train_windows: 1000000

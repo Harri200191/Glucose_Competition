@@ -1,0 +1,12 @@
+# The simple recurrent reference of stage B, run through the common front end so
+# it differs from the contenders only in the backbone.
+include: [base]
+
+model:
+  d_model: 128
+  fusion:
+    name: raw_concat
+  backbone:
+    name: lstm
+    n_layers: 2
+    dropout: 0.1

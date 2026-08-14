@@ -1,0 +1,11 @@
+# E1 -- persistence / linear trend / ridge / GBDT at 30/60/120 min.
+# Question: the basic floor, and a sanity check that the window pipeline is sane.
+# Driven by metabonet_forecasting.baselines.run_baselines, which ignores the
+# model: block and reads only the data: block.
+include: [base, data/core]
+
+data:
+  context: 288
+  sampling:
+    max_train_windows: 400000   # tabular fits are memory-bound, not GPU-bound
+    max_test_windows: 400000

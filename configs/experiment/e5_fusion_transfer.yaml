@@ -1,0 +1,4 @@
+# E5 -- repeat the best fusion with TCN and PatchTST.
+# Question: is any gain fusion-specific or Mamba-specific? A gain that appears
+# only with one backbone is a fact about that backbone, not about representation.
+include: [base, data/core, fusion/film]
