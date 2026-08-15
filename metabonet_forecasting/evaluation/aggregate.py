@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from ..common.logging import get_console_logger
+from ..data import constants as K
 from .bootstrap import paired_bootstrap, seed_variability
 
 LOG = get_console_logger("aggregate")
@@ -88,7 +89,7 @@ def collect(runs_dir: Path, pattern: str = "*") -> pd.DataFrame:
 
 
 def primary_table(df: pd.DataFrame, stratum: str = "all",
-                  horizons: Sequence[int] = (30, 60, 120)) -> pd.DataFrame:
+                  horizons: Sequence[int] = K.ALL_HORIZONS_MIN) -> pd.DataFrame:
     """The headline table: overall metrics per run and horizon, one row per run."""
     sel = df[(df["stratum"] == stratum) & (df["slice"] == "overall")
              & (df["horizon"].isin(list(horizons)))]
@@ -133,7 +134,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--pattern", default="*")
     ap.add_argument("--out", default="results")
     ap.add_argument("--stratum", default="all")
-    ap.add_argument("--horizons", default="30,60,120")
+    ap.add_argument("--horizons",
+                    default=",".join(str(h) for h in K.ALL_HORIZONS_MIN))
     ap.add_argument("--compare", nargs=2, metavar=("RUN_A", "RUN_B"), default=None,
                     help="paired patient-level bootstrap between two runs")
     ap.add_argument("--horizon", type=int, default=60)

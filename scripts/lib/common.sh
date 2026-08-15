@@ -1,9 +1,23 @@
 #!/usr/bin/env bash
 # Shared helpers for every script in this directory.
 #
-# The important one is the GPU queue: the ablation grids are dozens of
-# independent runs and this box has several GPUs, so `queue_run` dispatches jobs
-# round-robin and blocks when all slots are busy. One log file per run, always.
+# The important one is the GPU queue. The ablation grids are dozens of
+# independent runs and this box has 8 GPUs shared with ~48 other users, so
+# `queue_run` does admission control rather than plain round-robin: a job starts
+# only on a device that is *actually* free right now, and otherwise the queue
+# blocks. Two conditions have to hold together:
+#
+#   1. we are running fewer than JOBS_PER_GPU of our own jobs on that device;
+#   2. nvidia-smi reports at least GPU_FREE_MB MiB free on it.
+#
+# (2) is the one that matters here — another user's job is invisible to (1), and
+# dispatching on top of it is how a sweep dies at 3 a.m. with CUDA OOM. When no
+# device qualifies the queue polls every GPU_POLL_S seconds until one does,
+# whether that is because one of our jobs exited or because somebody else's did.
+#
+# A device that has just been handed a job is held back for GPU_WARMUP_S
+# seconds: torch takes tens of seconds to allocate, so its memory does not show
+# up in nvidia-smi yet and the same device would otherwise look free twice.
 #
 # Source it, do not execute it:  source "$(dirname "$0")/lib/common.sh"
 
@@ -18,10 +32,35 @@ LOG_DIR="${LOG_DIR:-$REPO_ROOT/logs/$(date +%Y%m%d)}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results}"
 STORE="${STORE:-$REPO_ROOT/artifacts/store/main}"
 
-# GPUs to use, comma separated. Default: every visible device.
-GPUS="${GPUS:-$(${PY} -c 'import torch;print(",".join(str(i) for i in range(torch.cuda.device_count())) or "")' 2>/dev/null || echo "")}"
-# How many runs share one GPU. Raise only if the models are small.
+# GPUs to use, comma separated, in *physical* nvidia-smi index space -- which is
+# also what CUDA_VISIBLE_DEVICES takes, so the memory we read and the device we
+# hand the child can never drift apart. (Asking torch for the count instead
+# returns 0..n-1 of whatever the parent shell already masked, which silently
+# means a different card.) Default: whatever CUDA_VISIBLE_DEVICES already
+# restricts us to, else every device on the box.
+_nvidia_indices() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  # `|| true`: pipefail is on, and a driver hiccup here must degrade to "no GPU",
+  # not abort every script that sources this file.
+  nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null \
+    | tr -d ' ' | paste -sd, - || true
+}
+GPUS="${GPUS:-${CUDA_VISIBLE_DEVICES:-$(_nvidia_indices)}}"
+# How many of OUR runs share one GPU. Raise only if the models are small.
 JOBS_PER_GPU="${JOBS_PER_GPU:-1}"
+# Free memory a device must report before we put a job on it. Measured on the
+# stage-E sweep: Mamba-2 at 288-step context, batch 256, holds 10.2-10.8 GiB, so
+# 12 GiB admits a run with headroom and refuses a card that cannot take one.
+# Raise it for a heavier model; check with
+#   nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+GPU_FREE_MB="${GPU_FREE_MB:-12000}"
+# How often to re-check when nothing qualifies, and how long to hold a device
+# back after handing it a job so its allocation shows up in nvidia-smi first.
+GPU_POLL_S="${GPU_POLL_S:-30}"
+GPU_WARMUP_S="${GPU_WARMUP_S:-90}"
+# Give up after this many seconds of waiting. 0 = wait forever (the default:
+# a sweep that queues behind other users is doing the right thing).
+GPU_WAIT_MAX_S="${GPU_WAIT_MAX_S:-0}"
 # Extra --set overrides applied to every run, e.g. EXTRA_SET="training.epochs=3"
 EXTRA_SET="${EXTRA_SET:-}"
 # DRY_RUN=1 prints the commands instead of running them.
@@ -39,50 +78,118 @@ require_store() {
 }
 
 # ------------------------------------------------------------------ GPU queue
-_gpu_list=()
-_slot_pids=()
+_gpu_ids=()          # devices we may schedule on, physical indices
+_slot_pid=()         # one entry per in-flight job
 _slot_gpu=()
+_slot_name=()
+declare -A _gpu_ready_at=()   # gpu -> epoch second before which we leave it alone
+declare -A _gpu_free_mb=()    # gpu -> MiB free at the last poll
+_queue_failed=0
 
 queue_init() {
-  _gpu_list=()
-  if [[ -n "$GPUS" ]]; then
-    IFS=',' read -r -a devices <<< "$GPUS"
-    for g in "${devices[@]}"; do
-      for ((j = 0; j < JOBS_PER_GPU; j++)); do _gpu_list+=("$g"); done
-    done
+  _gpu_ids=()
+  [[ -n "$GPUS" ]] && IFS=',' read -r -a _gpu_ids <<< "$GPUS"
+  _slot_pid=(); _slot_gpu=(); _slot_name=()
+  _gpu_ready_at=(); _gpu_free_mb=()
+  _queue_failed=0
+  if (( ${#_gpu_ids[@]} == 0 )); then
+    log "queue: no GPU visible -- running one job at a time on CPU"
   else
-    _gpu_list=("cpu")
+    log "queue: GPUs [$GPUS], <=$JOBS_PER_GPU job(s) each, admitted only at >= ${GPU_FREE_MB} MiB free"
   fi
-  _slot_pids=()
-  _slot_gpu=()
-  log "queue: ${#_gpu_list[@]} slots on GPUs [${GPUS:-cpu}]"
 }
 
-_wait_for_slot() {
-  while (( ${#_slot_pids[@]} >= ${#_gpu_list[@]} )); do
-    local still_pids=() still_gpu=()
-    for i in "${!_slot_pids[@]}"; do
-      if kill -0 "${_slot_pids[$i]}" 2>/dev/null; then
-        still_pids+=("${_slot_pids[$i]}"); still_gpu+=("${_slot_gpu[$i]}")
-      else
-        wait "${_slot_pids[$i]}" || warn "job ${_slot_pids[$i]} exited non-zero (see logs)"
-      fi
+# Harvest exited jobs so their slots (and their share of the device) come back.
+_reap() {
+  local pid=() gpu=() name=() i rc
+  for i in "${!_slot_pid[@]}"; do
+    if kill -0 "${_slot_pid[$i]}" 2>/dev/null; then
+      pid+=("${_slot_pid[$i]}"); gpu+=("${_slot_gpu[$i]}"); name+=("${_slot_name[$i]}")
+      continue
+    fi
+    rc=0; wait "${_slot_pid[$i]}" || rc=$?
+    if (( rc == 0 )); then
+      log "done  ${_slot_name[$i]} (GPU ${_slot_gpu[$i]})"
+    else
+      warn "FAILED ${_slot_name[$i]} rc=$rc -- $LOG_DIR/${_slot_name[$i]}.log"
+      _queue_failed=$(( _queue_failed + 1 ))
+    fi
+  done
+  _slot_pid=("${pid[@]}"); _slot_gpu=("${gpu[@]}"); _slot_name=("${name[@]}")
+  return 0
+}
+
+# One nvidia-smi call for the whole box, not one per device.
+_poll_gpu_mem() {
+  _gpu_free_mb=()
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  local idx used total
+  while IFS=, read -r idx used total; do
+    idx="${idx// /}"; used="${used// /}"; total="${total// /}"
+    [[ -n "$idx" && -n "$total" ]] && _gpu_free_mb["$idx"]=$(( total - used ))
+  done < <(nvidia-smi --query-gpu=index,memory.used,memory.total \
+             --format=csv,noheader,nounits 2>/dev/null)
+  return 0
+}
+
+_gpu_state() {
+  local g out=""
+  for g in "${_gpu_ids[@]}"; do out+="${g}=${_gpu_free_mb[$g]:-?}MiB "; done
+  echo "${out% }"
+}
+
+# Echo the eligible device with the most headroom, or fail if there is none.
+_pick_gpu() {
+  local now g i mine ready free best="" best_free=-1
+  now=$(date +%s)
+  for g in "${_gpu_ids[@]}"; do
+    mine=0
+    for i in "${!_slot_gpu[@]}"; do
+      [[ "${_slot_gpu[$i]}" == "$g" ]] && mine=$(( mine + 1 ))
     done
-    _slot_pids=("${still_pids[@]:-}"); _slot_gpu=("${still_gpu[@]:-}")
-    [[ -z "${_slot_pids[0]:-}" ]] && _slot_pids=() && _slot_gpu=()
-    (( ${#_slot_pids[@]} >= ${#_gpu_list[@]} )) && sleep 5
+    (( mine >= JOBS_PER_GPU )) && continue
+    ready="${_gpu_ready_at[$g]:-0}"
+    (( now < ready )) && continue
+    # No nvidia-smi reading for this device: fall back to capacity alone rather
+    # than deadlocking on a number we cannot obtain.
+    free="${_gpu_free_mb[$g]:-$GPU_FREE_MB}"
+    (( free < GPU_FREE_MB )) && continue
+    (( free > best_free )) && { best_free=$free; best="$g"; }
   done
+  [[ -n "$best" ]] || return 1
+  echo "$best"
 }
 
-_free_gpu() {
-  for g in "${_gpu_list[@]}"; do
-    local used=0
-    for busy in "${_slot_gpu[@]:-}"; do [[ "$busy" == "$g" ]] && used=$((used + 1)); done
-    local capacity=0
-    for slot in "${_gpu_list[@]}"; do [[ "$slot" == "$g" ]] && capacity=$((capacity + 1)); done
-    (( used < capacity )) && { echo "$g"; return; }
+# Block until a device is genuinely free, then leave it in _ACQUIRED_GPU.
+#
+# This sets a global instead of echoing, because the caller would have to write
+# `gpu="$(_acquire_gpu)"` -- a subshell, in which _reap would harvest exited jobs
+# from a *copy* of the slot arrays and the parent would go on believing every
+# slot is still busy. That deadlocks after the first full pass.
+_ACQUIRED_GPU=""
+_acquire_gpu() {
+  local waited=0
+  _ACQUIRED_GPU=""
+  if (( ${#_gpu_ids[@]} == 0 )); then          # CPU: strictly one at a time
+    while _reap; (( ${#_slot_pid[@]} >= 1 )); do sleep 5; done
+    _ACQUIRED_GPU="cpu"; return 0
+  fi
+  while true; do
+    _reap
+    _poll_gpu_mem
+    if _ACQUIRED_GPU="$(_pick_gpu)"; then return 0; fi
+    if (( GPU_WAIT_MAX_S > 0 && waited >= GPU_WAIT_MAX_S )); then
+      die "no GPU reached ${GPU_FREE_MB} MiB free in ${waited}s [$(_gpu_state)]"
+    fi
+    # Say something once we have actually blocked for a poll interval, then
+    # every five minutes -- not on every dispatch while the queue is saturated,
+    # which is the normal steady state and not news.
+    if (( waited == GPU_POLL_S || (waited > 0 && waited % 300 == 0) )); then
+      warn "waiting for >= ${GPU_FREE_MB} MiB free [$(_gpu_state)]; ${#_slot_pid[@]} of ours running, ${waited}s so far"
+    fi
+    sleep "$GPU_POLL_S"
+    waited=$(( waited + GPU_POLL_S ))
   done
-  echo "${_gpu_list[0]}"
 }
 
 # queue_run <run_name> <command...>
@@ -91,28 +198,31 @@ queue_run() {
   local logfile="$LOG_DIR/${name}.log"
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "GPU=? $* > $logfile"
-    return
+    return 0
   fi
-  _wait_for_slot
-  local gpu; gpu="$(_free_gpu)"
-  log "start $name on GPU $gpu -> $logfile"
+  _acquire_gpu
+  local gpu="$_ACQUIRED_GPU"
+  log "start $name on GPU $gpu (${_gpu_free_mb[$gpu]:-?} MiB free) -> $logfile"
   (
     if [[ "$gpu" != "cpu" ]]; then export CUDA_VISIBLE_DEVICES="$gpu"; fi
     "$@" > "$logfile" 2>&1
   ) &
-  _slot_pids+=("$!")
-  _slot_gpu+=("$gpu")
+  _slot_pid+=("$!"); _slot_gpu+=("$gpu"); _slot_name+=("$name")
+  if [[ "$gpu" != "cpu" ]]; then
+    _gpu_ready_at["$gpu"]=$(( $(date +%s) + GPU_WARMUP_S ))
+  fi
+  return 0
 }
 
 queue_wait() {
-  local failed=0
-  for pid in "${_slot_pids[@]:-}"; do
-    [[ -z "$pid" ]] && continue
-    wait "$pid" || { warn "job $pid failed"; failed=$((failed + 1)); }
+  while (( ${#_slot_pid[@]} > 0 )); do
+    _reap
+    (( ${#_slot_pid[@]} > 0 )) && sleep 5
   done
-  _slot_pids=(); _slot_gpu=()
-  (( failed > 0 )) && warn "$failed job(s) failed; check $LOG_DIR"
+  (( _queue_failed > 0 )) && warn "$_queue_failed job(s) failed; check $LOG_DIR"
   log "all queued jobs finished"
+  _queue_failed=0
+  return 0
 }
 
 # train <run_name> <config> [extra --set args...]

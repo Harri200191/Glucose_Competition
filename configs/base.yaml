@@ -8,7 +8,12 @@ data:
   store: artifacts/store/main
 
   context: 288                 # lattice steps of history (5 min each): 288 = 24 h
-  horizons_min: [30, 60, 120]  # primary horizons of the architecture paper
+  # Train and score all four. 30/60/120 are the paper's primary horizons; 90 is
+  # carried because the public benchmark scores it, and a horizon that is not in
+  # this list is never trained, never predicted and never scored -- the store
+  # holds its targets, but nothing reads them. One extra horizon costs one output
+  # unit and no extra data, so there is no reason to leave it out.
+  horizons_min: [30, 60, 90, 120]
   modalities: [cgm, insulin, carbs]
 
   use_event_features: true     # decay kernels + time-since-event (ablation D10)

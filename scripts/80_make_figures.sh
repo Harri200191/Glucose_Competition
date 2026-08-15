@@ -28,7 +28,7 @@ PY
 )}"
 log "best run by 60-minute RMSE: $BEST_RUN"
 
-for horizon in 30 60 120; do
+for horizon in 30 60 90 120; do
   $PY -m metabonet_forecasting.evaluation.plots "$RESULTS_DIR/all_runs.csv" \
     --out "$FIG_DIR" --metric rmse --horizon "$horizon" \
     --predictions "$RUNS_DIR/$BEST_RUN/predictions_test.parquet" \

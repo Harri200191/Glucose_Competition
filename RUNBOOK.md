@@ -144,8 +144,10 @@ What they pin down:
 
 ## 5. Stages B–G — the experiments
 
-Every stage is one script. All of them accept `SEEDS`, `CONTEXT`, `GPUS`, `EXTRA_SET`,
-`DRY_RUN=1`, and skip runs that are already scored (`SKIP_EXISTING=0` to force).
+Every stage is one script. All of them accept `SEEDS`, `CONTEXT`, `GPUS`, `JOBS_PER_GPU`,
+`GPU_FREE_MB`, `EXTRA_SET`, `DRY_RUN=1`, and skip runs that are already scored
+(`SKIP_EXISTING=0` to force). Jobs wait for a GPU that genuinely has room rather than
+piling onto a busy one — see §9.
 
 ```bash
 # B / E1 — the floor: persistence, linear trend, ridge, GBDT, simple LSTM
@@ -325,13 +327,31 @@ Three environment facts worth knowing before they cost you an afternoon:
    was measured at 0.04 s and at 31 s minutes apart. Prefer running long jobs detached
    (`setsid nohup ... &`) and judge progress from the phase log, not from wall clock.
 
-GPU scheduling: `scripts/lib/common.sh` runs jobs round-robin across `GPUS` (default: all
-visible devices), one job per GPU unless `JOBS_PER_GPU` says otherwise, one log file per
-run under `logs/<date>/`.
+GPU scheduling: `scripts/lib/common.sh` does **admission control**, not round-robin. A run
+starts only on a device that is free at that moment — fewer than `JOBS_PER_GPU` of our own
+jobs on it *and* at least `GPU_FREE_MB` MiB reported free by `nvidia-smi`. If nothing
+qualifies the queue polls every `GPU_POLL_S` seconds until something does, whether that is
+one of our jobs exiting or one of the other 47 users'. A device that has just been handed a
+job is skipped for `GPU_WARMUP_S` seconds, because torch takes tens of seconds to allocate
+and the card would otherwise look free twice. One log file per run under `logs/<date>/`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GPUS` | `CUDA_VISIBLE_DEVICES`, else every device | physical nvidia-smi indices |
+| `JOBS_PER_GPU` | 1 | how many of *our* runs may share a device |
+| `GPU_FREE_MB` | 12000 | free memory required to admit a run (Mamba-2 @ 288 measures 10.2–10.8 GiB) |
+| `GPU_POLL_S` | 30 | re-check interval while blocked |
+| `GPU_WARMUP_S` | 90 | hold-off after dispatch, so allocation shows up first |
+| `GPU_WAIT_MAX_S` | 0 | give up after this long; 0 = wait forever |
 
 ```bash
 GPUS="4,5,6,7" JOBS_PER_GPU=2 scripts/30_stageD_fusion_ablations.sh
+GPU_FREE_MB=20000 scripts/20_stageC_backbones.sh     # a heavier model
+GPU_WAIT_MAX_S=7200 scripts/50_stageF_context_length.sh  # fail rather than queue overnight
 ```
+
+Re-running a stage is always safe: anything already scored is skipped (`SKIP_EXISTING=0` to
+force), so a sweep that gives up on a full box picks up where it left off.
 
 ---
 

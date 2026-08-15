@@ -30,7 +30,8 @@ $PY - "$RESULTS_DIR/primary_table.csv" <<'PY'
 import sys, pandas as pd
 df = pd.read_csv(sys.argv[1])
 cols = [c for c in ("run", "backbone", "fusion", "context", "modalities", "seed",
-                    "rmse_30", "rmse_60", "rmse_120", "mard_60", "dts_A_60")
+                    "rmse_30", "rmse_60", "rmse_90", "rmse_120",
+                    "mard_60", "dts_A_60")
         if c in df.columns]
 print(df[cols].to_string(index=False))
 PY
