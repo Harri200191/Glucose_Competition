@@ -56,6 +56,8 @@ class DataBundle:
             "context": self.spec.context,
             "horizons_min": list(self.spec.horizons_min),
             "modalities": list(self.spec.modalities),
+            "future_modalities": list(self.spec.future_modalities),
+            "future_steps": self.spec.n_future_steps(),
             "channels": {m: self.spec.channels_for(m) for m in self.spec.modalities},
             "windows": {k: len(v) for k, v in self.datasets.items()},
             "subjects": {k: int(np.unique(
@@ -77,6 +79,9 @@ def window_spec_from_config(cfg: Config) -> WindowSpec:
         use_source_identity=bool(d.get("use_source_identity", False)),
         use_time_features=bool(d.get("use_time_features", True)),
         missing_policy=str(d.get("missing_policy", "zero")),
+        # Empty list = strictly causal = the benchmark. See constants.py.
+        future_modalities=list(d.get("future_modalities", []) or []),
+        future_steps=d.get("future_steps"),
     )
 
 
@@ -133,6 +138,7 @@ def build_data(cfg: Config, standardizer: Optional[Standardizer] = None) -> Data
 def model_input_shapes(bundle: DataBundle) -> Dict[str, object]:
     """What the model needs to know about its inputs, and nothing more."""
     ds = bundle.datasets["train"]
+    future_steps, future_channels = ds.future_shape
     return {
         "channel_counts": ds.channel_counts(),
         "n_time_features": ds.n_time_features,
@@ -140,4 +146,8 @@ def model_input_shapes(bundle: DataBundle) -> Dict[str, object]:
         "static_cardinalities": list(ds.cat_cardinalities) if bundle.spec.use_static else [],
         "context": bundle.spec.context,
         "n_horizons": ds.n_horizons,
+        # (0, 0) unless the run opted into planned future actions. The +1 channel
+        # is the validity flag the dataset appends.
+        "future_steps": future_steps,
+        "future_channels": future_channels + 1 if future_channels else 0,
     }

@@ -12,6 +12,12 @@
 # Note on argument style: `train`/`baseline` append their arguments to a single
 # --set list, so pass bare key=value overrides, not another --set.
 
+#
+# Planned future actions (off by default):
+#   FUTURE=insulin|carbs|both  expose post-anchor insulin/carbs to the model.
+#   Runs get a _futins/_futcarb/_futboth name suffix and are a DIFFERENT task
+#   from the causal benchmark -- see scripts/lib/common.sh.
+
 source "$(dirname "$0")/lib/common.sh"
 
 STORE="${SMOKE_STORE:-$REPO_ROOT/artifacts/store/smoke}"

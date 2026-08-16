@@ -26,7 +26,8 @@ from .bootstrap import paired_bootstrap, seed_variability
 LOG = get_console_logger("aggregate")
 
 FACTOR_COLUMNS = ["backbone", "fusion", "context", "modalities", "seed", "split",
-                  "event_features", "masks", "missing_policy", "source_identity"]
+                  "event_features", "masks", "missing_policy", "source_identity",
+                  "future"]
 
 
 def run_factors(run_dir: Path) -> Dict[str, object]:
@@ -55,6 +56,9 @@ def run_factors(run_dir: Path) -> Dict[str, object]:
         "masks": data.get("use_masks"),
         "missing_policy": data.get("missing_policy"),
         "source_identity": data.get("use_source_identity"),
+        # "none" for a causal run; otherwise which planned actions it could see.
+        # Grouping on this is how the future-covariate comparison is read.
+        "future": "+".join(data.get("future_modalities", []) or []) or "none",
         "parameters": info.get("parameters"),
         "receptive_field": info.get("receptive_field"),
         "best_val_rmse": _best_val(run_dir),

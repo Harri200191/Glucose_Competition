@@ -22,6 +22,12 @@
 # E5 (is the gain fusion-specific or Mamba-specific?) is the same ladder repeated
 # on TCN and PatchTST -- which is why BACKBONES defaults to all three.
 
+#
+# Planned future actions (off by default):
+#   FUTURE=insulin|carbs|both  expose post-anchor insulin/carbs to the model.
+#   Runs get a _futins/_futcarb/_futboth name suffix and are a DIFFERENT task
+#   from the causal benchmark -- see scripts/lib/common.sh.
+
 source "$(dirname "$0")/lib/common.sh"
 require_store
 

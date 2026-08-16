@@ -11,6 +11,12 @@
 # The bootstrap is the expensive part (patient resampling over every stratum and
 # horizon); 1000 replicates over ~50 runs takes tens of minutes on CPU.
 
+#
+# Planned future actions (off by default):
+#   FUTURE=insulin|carbs|both  expose post-anchor insulin/carbs to the model.
+#   Runs get a _futins/_futcarb/_futboth name suffix and are a DIFFERENT task
+#   from the causal benchmark -- see scripts/lib/common.sh.
+
 source "$(dirname "$0")/lib/common.sh"
 
 BOOT=0

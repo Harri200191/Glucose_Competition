@@ -23,9 +23,28 @@ import torch.nn as nn
 
 from ..common.registry import BACKBONES
 from .base import ForecastModel, ForecastOutput
-from .encoders import StaticEncoder, TimeEncoder, build_modality_encoders
+from .encoders import (FutureActionEncoder, StaticEncoder, TimeEncoder,
+                       build_modality_encoders)
 from .fusion import build_fusion
 from .heads import MultiHorizonHead
+
+
+def _build_future_encoder(shapes: Dict, model_cfg: Dict,
+                          encoder_cfg: Optional[Dict] = None):
+    """The planned-action encoder, or None when the run is strictly causal.
+
+    Shared by every architecture so that "with future covariates" means the same
+    thing in each of them.
+    """
+    steps = int(shapes.get("future_steps", 0) or 0)
+    channels = int(shapes.get("future_channels", 0) or 0)
+    if steps <= 0 or channels <= 0:
+        return None
+    encoder_cfg = encoder_cfg or {}
+    return FutureActionEncoder(
+        steps, channels, int(model_cfg.get("d_future", 32)),
+        hidden=model_cfg.get("future_hidden"),
+        dropout=float(encoder_cfg.get("dropout", 0.0)))
 
 
 class FrontEndForecaster(ForecastModel):
@@ -72,6 +91,10 @@ class FrontEndForecaster(ForecastModel):
             self.input_proj = None
 
         # --- stages 4 and 5 ---------------------------------------------------
+        # Planned future actions, only if this run asked for them.
+        self.future_encoder = _build_future_encoder(shapes, model_cfg, encoder_cfg)
+        d_extra = self.future_encoder.d_out if self.future_encoder is not None else 0
+
         backbone_name = str(backbone_cfg.pop("name", "tcn"))
         backbone_cfg.setdefault("context", self.context)
         self.backbone = BACKBONES.build(backbone_name, d_model=d_model, **backbone_cfg)
@@ -80,7 +103,7 @@ class FrontEndForecaster(ForecastModel):
             d_model, self.n_horizons, hidden=head_cfg.get("hidden"),
             pooling=str(head_cfg.get("pooling", "last_mean")),
             dropout=float(head_cfg.get("dropout", 0.0)),
-            quantiles=head_cfg.get("quantiles"))
+            quantiles=head_cfg.get("quantiles"), d_extra=d_extra)
 
     # ---------------------------------------------------------------- forward
     def forward(self, batch: Dict[str, torch.Tensor]) -> ForecastOutput:
@@ -105,7 +128,9 @@ class FrontEndForecaster(ForecastModel):
             z = self.fusion(encoded, static=static, time=time)
 
         seq = self.backbone(z)
-        point, quantiles = self.head(seq)
+        future = (self.future_encoder(batch["x_future"])
+                  if self.future_encoder is not None else None)
+        point, quantiles = self.head(seq, future)
         return ForecastOutput(pred_norm=point, quantiles=quantiles)
 
     # ------------------------------------------------------------------ meta
@@ -116,5 +141,6 @@ class FrontEndForecaster(ForecastModel):
         d = super().describe()
         d.update({"backbone": self.backbone_name, "fusion": self.fusion_name,
                   "d_model": self.d_model, "modalities": self.modalities,
-                  "context": self.context})
+                  "context": self.context,
+                  "future_covariates": self.future_encoder is not None})
         return d

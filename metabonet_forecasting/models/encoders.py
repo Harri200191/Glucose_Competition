@@ -170,6 +170,35 @@ class TimeEncoder(nn.Module):
         return self.proj(time)
 
 
+class FutureActionEncoder(nn.Module):
+    """Encodes the planned-intervention block that follows the anchor.
+
+    Only constructed when a run explicitly opts into future covariates; the
+    default benchmark never builds it, so the causal model is bit-for-bit what it
+    was before the option existed.
+
+    The block is flattened rather than pooled: *when* a dose lands inside the
+    forecast span matters as much as how much, and a sum over the window would
+    throw that away. At 24 steps and a handful of channels this is a small
+    matrix, so there is no reason to compress it.
+    """
+
+    def __init__(self, n_steps: int, n_channels: int, d_out: int,
+                 hidden: Optional[int] = None, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.n_steps, self.n_channels = n_steps, n_channels
+        hidden = hidden or max(d_out, 64)
+        self.net = nn.Sequential(
+            nn.Linear(n_steps * n_channels, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, d_out), nn.LayerNorm(d_out),
+        )
+        self.d_out = d_out
+
+    def forward(self, x_future: torch.Tensor) -> torch.Tensor:
+        """[B, F, C] -> [B, d_out]"""
+        return self.net(x_future.reshape(x_future.shape[0], -1))
+
+
 def build_modality_encoders(channel_counts: Dict[str, int], d_model: int,
                             cfg: Dict) -> nn.ModuleDict:
     """One encoder per present modality, sized from the config."""

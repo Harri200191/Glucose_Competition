@@ -125,6 +125,11 @@ class PrepareConfig:
     anchor_stride: int = 6             # one anchor per 30 min; r(CGM_t, CGM_t+5) ~ 0.99
     require_clean_history: bool = True  # no CGM gap > max_cgm_gap_min inside the window
 
+    # Submission mode: take anchors from a competition template instead of the
+    # stride/quality rules. Every template row must be predicted, so none of the
+    # usual filters may drop one -- see _template_anchors.
+    anchors_from: Optional[str] = None
+
     # Scale control for smoke builds / debugging
     row_groups: Optional[int] = None   # read only the first N parquet row groups
     max_subjects: Optional[int] = None
@@ -307,10 +312,34 @@ def _read_corpus(cfg: PrepareConfig) -> Tuple[Dict[str, np.ndarray], Dict[str, D
     return data, vocab
 
 
+def _template_subject_keys(template: str, vocab: Dict[str, Dict[str, int]]) -> np.ndarray:
+    """The packed subject keys named by a submission template."""
+    t = pd.read_parquet(template, columns=["source_file", "id"]).drop_duplicates()
+    keys, missing = [], []
+    for src, pid in zip(t["source_file"].astype(str), t["id"].astype(str)):
+        if src in vocab["source_file"] and pid in vocab["id"]:
+            keys.append(vocab["source_file"][src] * (10 ** 7) + vocab["id"][pid])
+        else:
+            missing.append((src, pid))
+    if missing:
+        raise ValueError(
+            f"{len(missing)} template subjects are absent from this corpus, e.g. "
+            f"{missing[:3]}. A submission store must be built from the file that "
+            f"contains the template's own history.")
+    return np.array(sorted(set(keys)), dtype=np.int64)
+
+
 def _select_subjects(data: Dict[str, np.ndarray], vocab: Dict[str, Dict[str, int]],
                      cfg: PrepareConfig) -> np.ndarray:
-    """Row mask implementing --cohorts / --max-subjects."""
+    """Row mask implementing --cohorts / --max-subjects / --anchors-from."""
     keep = np.ones(len(data["cgm"]), dtype=bool)
+    if cfg.anchors_from:
+        # Keep only the patients the template asks about. On the full corpus this
+        # is the difference between a 90-minute build and a 5-minute one.
+        wanted = _template_subject_keys(cfg.anchors_from, vocab)
+        subject = data["cohort"].astype(np.int64) * (10 ** 7) + data["pid"].astype(np.int64)
+        keep &= np.isin(subject, wanted)
+        LOG.info(f"template names {len(wanted)} subjects; keeping their rows only")
     if cfg.cohorts:
         wanted = {vocab["source_file"][c] for c in cfg.cohorts if c in vocab["source_file"]}
         missing = [c for c in cfg.cohorts if c not in vocab["source_file"]]
@@ -503,7 +532,11 @@ def _build_store(cfg: PrepareConfig) -> Path:
 
     # --- 6. anchors -------------------------------------------------------------
     phase6 = Phase("anchors", stats).__enter__()
-    anchors = _select_anchors(cfg, starts, ends, cgm_observed, data["is_test"], stats)
+    _template_anchors._vocab = vocab
+    if cfg.anchors_from:
+        anchors = _template_anchors(cfg, subject, data["time_min"], starts, ends, stats)
+    else:
+        anchors = _select_anchors(cfg, starts, ends, cgm_observed, data["is_test"], stats)
     seg_end_row = np.repeat(ends.astype(np.int64), lengths)
     targets = _build_targets(anchors["row"].to_numpy(), cgm, cgm_observed,
                              data["is_test"], seg_end_row)
@@ -646,6 +679,64 @@ def _select_anchors(cfg: PrepareConfig, starts: np.ndarray, ends: np.ndarray,
     return df
 
 
+def _template_anchors(cfg: PrepareConfig, subject: np.ndarray, time_min: np.ndarray,
+                      starts: np.ndarray, ends: np.ndarray,
+                      stats: Dict[str, object]) -> pd.DataFrame:
+    """One anchor per template row, in template order, with no filtering at all.
+
+    The stride and history-quality rules that build a *training* anchor set must
+    not run here: a submission has to carry a prediction for every row the
+    organisers ask about, including rows with a short or gappy history. Those
+    still get a window -- ``WindowDataset(pad_history=True)`` left-pads it and
+    marks the padding unobserved -- so the model sees an honest "nothing here"
+    rather than the tail of somebody else's recording.
+
+    ``template_row`` preserves the original order so the submission can be
+    written back in exactly the row order the template defines.
+    """
+    t = pd.read_parquet(cfg.anchors_from, columns=["source_file", "id", "date"])
+    want_time = (t["date"].to_numpy().astype("datetime64[m]").astype(np.int64))
+
+    # Rows are sorted by (subject, time), so a packed key is sorted too and the
+    # lookup is a binary search rather than a 100M-entry dictionary.
+    row_key = subject * np.int64(10 ** 9) + time_min
+    order = np.argsort(row_key, kind="stable")
+    sorted_key = row_key[order]
+
+    import json as _json
+    manifest_vocab = getattr(_template_anchors, "_vocab", None)
+    if manifest_vocab is None:
+        raise RuntimeError("vocabulary not attached; build_store must set it")
+    src_v, id_v = manifest_vocab["source_file"], manifest_vocab["id"]
+    subj = np.array([src_v[str(a)] * (10 ** 7) + id_v[str(b)]
+                     for a, b in zip(t["source_file"], t["id"])], dtype=np.int64)
+    want_key = subj * np.int64(10 ** 9) + want_time
+
+    pos = np.searchsorted(sorted_key, want_key)
+    pos_clipped = np.clip(pos, 0, sorted_key.size - 1)
+    found = sorted_key[pos_clipped] == want_key
+    rows = np.where(found, order[pos_clipped], -1)
+    if not found.all():
+        raise ValueError(
+            f"{int((~found).sum())} of {found.size} template rows have no matching "
+            f"timestamp in the corpus (first: {t.iloc[int(np.flatnonzero(~found)[0])].to_dict()})")
+
+    seg_of_row = np.repeat(np.arange(len(starts)), ends - starts)
+    seg = seg_of_row[rows]
+    pos_in_seg = rows - starts[seg]
+    stats["template_anchors"] = int(found.size)
+    stats["template_short_history"] = int((pos_in_seg < cfg.min_history_steps - 1).sum())
+    LOG.info(f"template anchors: {found.size:,} rows located; "
+             f"{stats['template_short_history']:,} have less than "
+             f"{cfg.min_history_steps} steps of history and will be left-padded")
+    return pd.DataFrame({
+        "row": rows.astype(np.int64),
+        "seg": seg.astype(np.int32),
+        "pos_in_seg": pos_in_seg.astype(np.int32),
+        "template_row": np.arange(found.size, dtype=np.int64),
+    })
+
+
 def _build_targets(rows: np.ndarray, cgm_raw: np.ndarray, cgm_observed: np.ndarray,
                    is_test: np.ndarray, seg_end: np.ndarray) -> np.ndarray:
     """CGM at t+h for each anchor and horizon; NaN where the label is unusable.
@@ -753,6 +844,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--anchor-stride", type=int, default=d.anchor_stride)
     p.add_argument("--allow-dirty-history", action="store_true",
                    help="do not require a gap-free CGM history in the window")
+    p.add_argument("--anchors-from", default=None,
+                   help="competition template parquet: build a submission store whose "
+                        "anchors are exactly its rows, unfiltered and in its order")
     p.add_argument("--row-groups", type=int, default=None,
                    help="read only the first N parquet row groups (smoke builds)")
     p.add_argument("--max-subjects", type=int, default=None)
@@ -764,7 +858,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         corpus=a.corpus, out=a.out, max_cgm_gap_min=a.max_cgm_gap_min,
         interp_gap_min=a.interp_gap_min, min_segment_min=a.min_segment_min,
         min_history_steps=a.min_history_steps, anchor_stride=a.anchor_stride,
-        require_clean_history=not a.allow_dirty_history, row_groups=a.row_groups,
+        require_clean_history=not a.allow_dirty_history, anchors_from=a.anchors_from,
+        row_groups=a.row_groups,
         max_subjects=a.max_subjects,
         cohorts=a.cohorts.split(",") if a.cohorts else None,
         subject_seed=a.subject_seed,

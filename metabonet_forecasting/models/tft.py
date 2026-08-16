@@ -30,6 +30,7 @@ import torch.nn.functional as F
 
 from .base import ForecastModel, ForecastOutput
 from .encoders import StaticEncoder
+from .frontend import _build_future_encoder
 from .heads import MultiHorizonHead
 
 
@@ -148,10 +149,12 @@ class TFTForecaster(ForecastModel):
         self.attention = InterpretableMultiHeadAttention(d_model, n_heads, dropout)
         self.post_attn_norm = nn.LayerNorm(d_model)
         self.position_wise = GRN(d_model, d_model, d_model, dropout)
-        self.head = MultiHorizonHead(d_model, self.n_horizons,
-                                     pooling=str(model_cfg.get("head", {})
-                                                 .get("pooling", "last")),
-                                     dropout=dropout)
+        self.future_encoder = _build_future_encoder(shapes, model_cfg)
+        self.head = MultiHorizonHead(
+            d_model, self.n_horizons,
+            pooling=str(model_cfg.get("head", {}).get("pooling", "last")),
+            dropout=dropout,
+            d_extra=self.future_encoder.d_out if self.future_encoder is not None else 0)
         self.last_variable_weights: Optional[torch.Tensor] = None
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> ForecastOutput:
@@ -174,12 +177,15 @@ class TFTForecaster(ForecastModel):
         attn_out, _ = self.attention(h)
         h = self.post_attn_norm(h + attn_out)
         h = self.position_wise(h)
-        point, quantiles = self.head(h)
+        future = (self.future_encoder(batch["x_future"])
+                  if self.future_encoder is not None else None)
+        point, quantiles = self.head(h, future)
         return ForecastOutput(pred_norm=point, quantiles=quantiles,
                               aux={"variable_weights": self.last_variable_weights})
 
     def describe(self) -> Dict[str, object]:
         d = super().describe()
         d.update({"backbone": "tft", "fusion": "native_variable_selection",
-                  "n_variables": self.n_vars})
+                  "n_variables": self.n_vars,
+                  "future_covariates": self.future_encoder is not None})
         return d

@@ -11,6 +11,12 @@
 # Cost on the full corpus: roughly 30-60 minutes and ~15 GB of disk, dominated by
 # the parquet scan and the per-segment IIR filters. Peak RAM is around 40 GB.
 
+#
+# Planned future actions (off by default):
+#   FUTURE=insulin|carbs|both  expose post-anchor insulin/carbs to the model.
+#   Runs get a _futins/_futcarb/_futboth name suffix and are a DIFFERENT task
+#   from the causal benchmark -- see scripts/lib/common.sh.
+
 source "$(dirname "$0")/lib/common.sh"
 
 MODE="${1:-full}"

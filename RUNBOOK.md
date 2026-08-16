@@ -198,6 +198,45 @@ about *conditioning* from a claim about *encoding*. FiLM is initialised as the i
 
 ---
 
+## 5b. Planned future actions (off by default)
+
+Every script accepts `FUTURE`, which lets the model read insulin and/or
+carbohydrate values from **after** the forecast anchor:
+
+```bash
+FUTURE=insulin scripts/20_stageC_backbones.sh    # future insulin schedule visible
+FUTURE=carbs   scripts/30_stageD_fusion_ablations.sh
+FUTURE=both    scripts/40_stageE_modality_ablations.sh
+FUTURE_STEPS=6 FUTURE=both scripts/...           # only the next 30 min, instead of 120
+
+scripts/35_future_covariates.sh                  # the dedicated 4-arm comparison
+RUN_BASELINES=1 scripts/35_future_covariates.sh  # + GBDT, the leaderboard recipe
+```
+
+`FUTURE=none` is the default everywhere and the benchmark; runs that opt in get a
+`_futins` / `_futcarb` / `_futboth` name suffix so they can never be confused with
+their causal twin, and `future` becomes a column in `results/all_runs.csv` so the
+comparison is a group-by.
+
+**This changes the task, it does not improve the model.** A forecast answers
+"given what is known now, what will glucose be?"; reading post-anchor doses
+answers "given that this dose is delivered, what will glucose be?". Both are
+legitimate, neither is comparable to the other, and only the first is a forecast.
+
+In this corpus the distinction is not academic: **85.8 % of rows are AID**
+(closed-loop; Loop alone is 61.2 %), where delivery at t+k is computed by a
+control algorithm from the CGM at t+k. Future insulin there is not a plan a
+patient made — it is the label, transformed. Measured on the smoke slice, giving
+a GBDT nothing but future dose and carbohydrate sums moves DTS zone A from
+84.3 → 86.3 at 30 min and 47.7 → 57.0 at 120 min. A gain that *grows* with
+horizon is the signature: a genuine planned-action signal would not behave that
+way, but a controller's reaction to the very glucose you are predicting does.
+
+Only the raw per-slot values and their masks are exposed, never the exponential
+exposures (those accumulate the past and have no forward definition), and the
+block never crosses the end of the anchor's segment. Anything produced this way
+belongs in its own table, clearly labelled.
+
 ## 6. Running one thing by hand
 
 ```bash
@@ -278,6 +317,54 @@ the paired difference, its interval, a bootstrap p-value, and the share of patie
 which A wins.
 
 ---
+
+## 7b. Competition submissions
+
+```bash
+scripts/90_make_submission.sh e9_mamba2_film_s0_futboth        # both competitions
+COMPETITION=annual scripts/90_make_submission.sh <RUN_NAME>    # just the annual one
+```
+
+Submissions go through `prepare.py --anchors-from <template>`, which builds a
+store whose anchors are exactly the template's rows, in the template's order,
+using the same cleaning, segmentation and exposure code as the training data.
+That is deliberate: an inference path that computes features slightly differently
+from the training path is the standard way to ship a model that looked good
+locally and scored badly on submission.
+
+`submission/predict.py` then loads the run's own frozen `standardizer.json` and
+`best.pt`, refuses to write a partially filled horizon column, leaves untrained
+horizons entirely NaN, and checks the row order against the template before
+saving. Two traps it handles that are easy to miss:
+
+* **categorical vocabularies.** Each store numbers `gender` / `modality` /
+  `source_file` in first-appearance order *within its own file*. The holdout has
+  two genders, the corpus has four — so the same integer means different things,
+  and an embedding trained on one indexed with the other's codes is wrong
+  silently whenever the counts happen to match. `align_categoricals` re-maps by
+  name into the training store's index space; a level the corpus never saw (the
+  holdout's synthetic `source_file`) becomes the reserved unknown embedding.
+* **short history.** A template row can sit near the start of a recording.
+  `WindowDataset(pad_history=True)` left-pads with zeros and an unobserved mask,
+  so the window says "nothing here" instead of reaching into another patient.
+  Training never sets that flag.
+
+The two competitions are different tasks:
+
+| | annual | live leaderboard |
+|---|---|---|
+| rows | 2,228 | 2,648,987 |
+| source | separate secret holdout file | the public corpus |
+| labels | **masked** — CGM at +30/60/90/120 is `-1` for 100% of anchors | ship with the toolkit |
+| scoring | server-side | local |
+
+**On future covariates and the rules.** The organisers masked future *CGM* in the
+holdout and left future *insulin* fully present (100% of anchors). Using it is
+therefore permitted by their own data design, which is how a 92% zone-A score at
+30 minutes appears on the leaderboard — our `_futboth` run reproduces exactly
+that. It is still not a forecasting number; see §5b. One quirk worth knowing:
+the annual holdout contains **no carbohydrate data at all** (100% NaN), so the
+carbohydrate half of a `_futboth` model contributes nothing there.
 
 ## 8. Model zoo
 

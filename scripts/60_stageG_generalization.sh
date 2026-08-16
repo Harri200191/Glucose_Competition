@@ -20,6 +20,12 @@
 # Subgroup analyses (age, device, source) belong *after* the primary comparison
 # is frozen; the scored metrics already carry per-source breakdowns for that.
 
+#
+# Planned future actions (off by default):
+#   FUTURE=insulin|carbs|both  expose post-anchor insulin/carbs to the model.
+#   Runs get a _futins/_futcarb/_futboth name suffix and are a DIFFERENT task
+#   from the causal benchmark -- see scripts/lib/common.sh.
+
 source "$(dirname "$0")/lib/common.sh"
 require_store
 

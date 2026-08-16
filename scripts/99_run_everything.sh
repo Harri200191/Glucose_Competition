@@ -21,6 +21,12 @@
 # Reduce with SEEDS, EXTRA_SET="data.sampling.max_train_windows=500000", or by
 # running the stage scripts individually.
 
+#
+# Planned future actions (off by default):
+#   FUTURE=insulin|carbs|both  expose post-anchor insulin/carbs to the model.
+#   Runs get a _futins/_futcarb/_futboth name suffix and are a DIFFERENT task
+#   from the causal benchmark -- see scripts/lib/common.sh.
+
 source "$(dirname "$0")/lib/common.sh"
 
 STAGES="${STAGES:-prep test B C D E F G}"

@@ -63,6 +63,36 @@ GPU_WARMUP_S="${GPU_WARMUP_S:-90}"
 GPU_WAIT_MAX_S="${GPU_WAIT_MAX_S:-0}"
 # Extra --set overrides applied to every run, e.g. EXTRA_SET="training.epochs=3"
 EXTRA_SET="${EXTRA_SET:-}"
+
+# ---------------------------------------------------- planned future actions
+# FUTURE lets any script in this directory read insulin and/or carbohydrate
+# values from *after* the forecast anchor:
+#
+#   FUTURE=none      (default) strictly causal -- the benchmark
+#   FUTURE=insulin   future insulin schedule visible
+#   FUTURE=carbs     future carbohydrate entries visible
+#   FUTURE=both      both
+#
+# Off unless asked for, and every enabled run gets a name suffix so it can never
+# overwrite or be confused with its causal twin. This is a different task, not a
+# better model: 85.8% of this corpus is closed-loop, where insulin at t+k is a
+# function of the CGM at t+k, so most of any gain is the label leaking backwards.
+# Use it to measure that; never to report a forecasting result.
+FUTURE="${FUTURE:-none}"
+case "$FUTURE" in
+  none|"")        _FUTURE_SET=""; _FUTURE_TAG="" ;;
+  insulin)        _FUTURE_SET="data.future_modalities=['insulin']"; _FUTURE_TAG="_futins" ;;
+  carbs)          _FUTURE_SET="data.future_modalities=['carbs']";   _FUTURE_TAG="_futcarb" ;;
+  both|all)       _FUTURE_SET="data.future_modalities=['insulin','carbs']"; _FUTURE_TAG="_futboth" ;;
+  *) echo "FUTURE must be one of: none insulin carbs both (got '$FUTURE')" >&2; exit 2 ;;
+esac
+# Optional: how many 5-minute steps past the anchor to expose. Default (unset)
+# is out to the longest horizon being forecast.
+FUTURE_STEPS="${FUTURE_STEPS:-}"
+if [[ -n "$_FUTURE_SET" && -n "$FUTURE_STEPS" ]]; then
+  _FUTURE_SET="$_FUTURE_SET data.future_steps=$FUTURE_STEPS"
+  _FUTURE_TAG="${_FUTURE_TAG}${FUTURE_STEPS}"
+fi
 # DRY_RUN=1 prints the commands instead of running them.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -227,26 +257,26 @@ queue_wait() {
 
 # train <run_name> <config> [extra --set args...]
 train() {
-  local name="$1" config="$2"; shift 2
+  local name="$1$_FUTURE_TAG" config="$2"; shift 2
   if [[ -f "$RUNS_DIR/$name/metrics.json" && "${SKIP_EXISTING:-1}" == "1" ]]; then
     log "skip $name (already scored; SKIP_EXISTING=0 to force)"
     return
   fi
   queue_run "$name" $PY -m metabonet_forecasting.training.train \
     --config "$config" --name "$name" --runs-dir "$RUNS_DIR" \
-    --set "data.store=$STORE" $EXTRA_SET "$@"
+    --set "data.store=$STORE" $_FUTURE_SET $EXTRA_SET "$@"
 }
 
 # baseline <run_name> <config> <model> [extra --set args...]
 baseline() {
-  local name="$1" config="$2" model="$3"; shift 3
+  local name="$1$_FUTURE_TAG" config="$2" model="$3"; shift 3
   if [[ -f "$RUNS_DIR/$name/metrics.json" && "${SKIP_EXISTING:-1}" == "1" ]]; then
     log "skip $name (already scored)"
     return
   fi
   queue_run "$name" $PY -m metabonet_forecasting.baselines.run_baselines \
     --config "$config" --model "$model" --name "$name" --runs-dir "$RUNS_DIR" \
-    --set "data.store=$STORE" $EXTRA_SET "$@"
+    --set "data.store=$STORE" $_FUTURE_SET $EXTRA_SET "$@"
 }
 
 summarise() {

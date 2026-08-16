@@ -12,6 +12,12 @@
 # Figures are only as honest as the runs behind them: a curve with one seed per
 # point has no error bar, and the plotting code draws what it is given.
 
+#
+# Planned future actions (off by default):
+#   FUTURE=insulin|carbs|both  expose post-anchor insulin/carbs to the model.
+#   Runs get a _futins/_futcarb/_futboth name suffix and are a DIFFERENT task
+#   from the causal benchmark -- see scripts/lib/common.sh.
+
 source "$(dirname "$0")/lib/common.sh"
 
 FIG_DIR="${FIG_DIR:-$REPO_ROOT/figures}"

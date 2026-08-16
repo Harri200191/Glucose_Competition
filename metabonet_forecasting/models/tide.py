@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from .base import ForecastModel, ForecastOutput
 from .encoders import StaticEncoder
+from .frontend import _build_future_encoder
 
 
 class ResidualBlock(nn.Module):
@@ -62,8 +63,15 @@ class TiDEForecaster(ForecastModel):
             int(shapes["n_static_numeric"]), list(shapes["static_cardinalities"]),
             d_static, emb_dim=int(model_cfg.get("static_emb_dim", 8)), dropout=dropout)
 
+        # TiDE natively takes future covariates into the dense encoder, so when a
+        # run opts in they go there rather than through the shared head -- the
+        # one architecture where the native placement and the shared placement
+        # coincide.
+        self.future_encoder = _build_future_encoder(shapes, model_cfg)
+        d_future = self.future_encoder.d_out if self.future_encoder is not None else 0
+
         self.feature_proj = ResidualBlock(n_cov, d_hidden, r, dropout)
-        enc_in = self.context * r + d_static + self.context   # + raw lookback CGM
+        enc_in = self.context * r + d_static + self.context + d_future  # + lookback CGM
         layers = [ResidualBlock(enc_in, d_hidden, d_hidden, dropout)]
         layers += [ResidualBlock(d_hidden, d_hidden, d_hidden, dropout)
                    for _ in range(n_enc - 1)]
@@ -93,7 +101,10 @@ class TiDEForecaster(ForecastModel):
         lookback = batch["x_cgm"][..., 0]                    # normalised CGM series
         proj = self.feature_proj(cov).reshape(b, -1)         # [B, L*r]
         s = self.static_encoder(batch["static_num"], batch["static_cat"])
-        e = self.encoder(torch.cat([lookback, proj, s], dim=-1))
+        parts_enc = [lookback, proj, s]
+        if self.future_encoder is not None:
+            parts_enc.append(self.future_encoder(batch["x_future"]))
+        e = self.encoder(torch.cat(parts_enc, dim=-1))
         g = self.decoder(e).reshape(b, self.n_horizons, self.p)
 
         h_emb = self.horizon_embedding.unsqueeze(0).expand(b, -1, -1)
@@ -103,5 +114,6 @@ class TiDEForecaster(ForecastModel):
 
     def describe(self) -> Dict[str, object]:
         d = super().describe()
-        d.update({"backbone": "tide", "fusion": "native_dense", "context": self.context})
+        d.update({"backbone": "tide", "fusion": "native_dense", "context": self.context,
+                  "future_covariates": self.future_encoder is not None})
         return d

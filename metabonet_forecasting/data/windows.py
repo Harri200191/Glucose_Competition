@@ -27,7 +27,7 @@ label is read from ``targets.npy``, which prepare.py built from rows strictly af
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -53,6 +53,29 @@ class WindowSpec:
     use_time_features: bool = True
     missing_policy: str = "zero"             # zero | ffill | learned
 
+    # --- planned future actions: OFF by default, and must stay that way -------
+    # Empty means the window is strictly causal, which is the benchmark. Adding
+    # "insulin" and/or "carbs" lets the model read those channels from *after*
+    # the anchor, which changes the task (see constants.FUTURE_MODALITY_CHANNELS)
+    # and makes the result incomparable with every causal run.
+    future_modalities: List[str] = field(default_factory=list)
+    # How far past the anchor to read. None = out to the longest horizon, so the
+    # model sees the interventions covering exactly the span it forecasts.
+    future_steps: Optional[int] = None
+
+    def n_future_steps(self) -> int:
+        if not self.future_modalities:
+            return 0
+        if self.future_steps is not None:
+            return int(self.future_steps)
+        return max(self.horizons_min) // K.GRID_MIN
+
+    def future_channels(self) -> List[str]:
+        out: List[str] = []
+        for m in self.future_modalities:
+            out.extend(K.FUTURE_MODALITY_CHANNELS[m])
+        return out
+
     def channels_for(self, modality: str) -> List[str]:
         names = list(K.MODALITY_CHANNELS[modality])
         if not self.use_event_features:
@@ -65,9 +88,17 @@ class WindowSpec:
         return names
 
     def all_channels(self) -> List[str]:
+        """Every channel a run touches, history and future alike.
+
+        Normalisation statistics are fitted over this list, so a future-only
+        channel still gets scaled from training data rather than left raw.
+        """
         out: List[str] = []
         for m in self.modalities:
             out.extend(self.channels_for(m))
+        for name in self.future_channels():
+            if name not in out:
+                out.append(name)
         return out
 
     def validate(self) -> None:
@@ -79,15 +110,29 @@ class WindowSpec:
             raise ValueError("cgm is the forecast state and cannot be ablated away")
         if self.missing_policy not in ("zero", "ffill", "learned"):
             raise ValueError(f"unknown missing_policy {self.missing_policy!r}")
+        unknown_future = [m for m in self.future_modalities
+                          if m not in K.FUTURE_MODALITY_CHANNELS]
+        if unknown_future:
+            raise ValueError(f"unknown future modalities {unknown_future}; "
+                             f"have {sorted(K.FUTURE_MODALITY_CHANNELS)}")
+        if self.future_modalities and self.n_future_steps() <= 0:
+            raise ValueError("future_steps must be positive when future "
+                             "modalities are requested")
 
 
 class WindowDataset(Dataset):
     """Lazily gathers windows out of the memmapped store."""
 
     def __init__(self, store: SequenceStore, mask: np.ndarray, spec: WindowSpec,
-                 standardizer: Standardizer) -> None:
+                 standardizer: Standardizer, pad_history: bool = False) -> None:
         spec.validate()
-        if spec.context > store.min_history_steps:
+        # pad_history exists for submissions: a competition template asks for a
+        # prediction at every row it lists, including rows whose recording starts
+        # less than `context` ago. Training never uses it -- the store's anchor
+        # rules guarantee full history there -- so the benchmark cannot silently
+        # start training on padded windows.
+        self.pad_history = pad_history
+        if spec.context > store.min_history_steps and not pad_history:
             raise ValueError(
                 f"context {spec.context} exceeds the history guaranteed by this store "
                 f"({store.min_history_steps}); rebuild with --min-history-steps")
@@ -121,6 +166,25 @@ class WindowDataset(Dataset):
         # Relative minute offsets of the window's steps from the anchor.
         self._offsets = np.arange(-(spec.context - 1), 1, dtype=np.float32) * K.GRID_MIN
 
+        # --- planned future actions, only when a run has opted in -------------
+        self.future_names: List[str] = spec.future_channels()
+        self.n_future = spec.n_future_steps()
+        if self.future_names:
+            self.future_ids = store.channel_ids(self.future_names)
+            # How far the future block may legitimately run: never past the end
+            # of the anchor's own segment. Beyond that the next rows belong to a
+            # different recording (or a different patient), so they are zeroed
+            # and flagged rather than read.
+            seg_end = store.segments.set_index("seg")["end"]
+            self.seg_end = seg_end.loc[a["seg"].to_numpy()].to_numpy()
+        else:
+            self.future_ids = np.zeros(0, dtype=np.int64)
+            self.seg_end = None
+        # Where each anchor's own recording begins, so a padded window can never
+        # reach back into the previous patient's data.
+        self.seg_start = (store.segments.set_index("seg")["start"]
+                          .loc[a["seg"].to_numpy()].to_numpy() if pad_history else None)
+
     # ------------------------------------------------------------------ shapes
     def channel_counts(self) -> Dict[str, int]:
         return {m: len(self.channel_names[m]) for m in self.modalities}
@@ -133,6 +197,11 @@ class WindowDataset(Dataset):
     def n_horizons(self) -> int:
         return len(self.spec.horizons_min)
 
+    @property
+    def future_shape(self) -> Tuple[int, int]:
+        """(steps, channels) of the planned-action block; (0, 0) when disabled."""
+        return (self.n_future, len(self.future_names)) if self.future_names else (0, 0)
+
     def __len__(self) -> int:
         return int(self.indices.size)
 
@@ -141,7 +210,12 @@ class WindowDataset(Dataset):
         ai = int(self.indices[i])
         row = int(self.rows[ai])
         L = self.spec.context
-        block = np.asarray(self.store.channels[row - L + 1: row + 1])
+        lo = row - L + 1
+        n_pad = 0
+        if self.pad_history:
+            lo = max(lo, int(self.seg_start[ai]), 0)
+            n_pad = L - (row + 1 - lo)
+        block = np.asarray(self.store.channels[lo: row + 1])
 
         item: Dict[str, torch.Tensor] = {}
         for m in self.modalities:
@@ -150,10 +224,33 @@ class WindowDataset(Dataset):
             mask_cols = [j for j, n in enumerate(self.channel_names[m])
                          if n.endswith("_mask")]
             filled = fill_missing(norm, None, self.spec.missing_policy)
+            if n_pad:
+                # Zeros at the head: for a value channel that is the training
+                # centre, and for an observation mask it is an explicit "not
+                # recorded", which is exactly what a window that predates the
+                # recording should say.
+                filled = np.concatenate(
+                    [np.zeros((n_pad, filled.shape[1]), np.float32), filled], axis=0)
             item[f"x_{m}"] = torch.from_numpy(np.ascontiguousarray(filled))
             if mask_cols:
                 item[f"m_{m}"] = torch.from_numpy(
                     np.ascontiguousarray(filled[:, mask_cols]))
+
+        if self.future_names:
+            # Rows strictly after the anchor. Anything past the segment end is
+            # zero-filled and marked absent in the trailing validity column, so
+            # a short segment cannot leak the start of the next recording.
+            n_f = self.n_future
+            usable = int(min(n_f, max(int(self.seg_end[ai]) - row - 1, 0)))
+            block = np.zeros((n_f, len(self.future_names) + 1), dtype=np.float32)
+            if usable > 0:
+                raw = np.asarray(
+                    self.store.channels[row + 1: row + 1 + usable])[:, self.future_ids]
+                block[:usable, :-1] = fill_missing(
+                    self.std.transform_channels(raw, self.future_names),
+                    None, self.spec.missing_policy)
+                block[:usable, -1] = 1.0
+            item["x_future"] = torch.from_numpy(block)
 
         if self.spec.use_time_features:
             minutes = (self.tod_min[ai] + self._offsets) % 1440.0

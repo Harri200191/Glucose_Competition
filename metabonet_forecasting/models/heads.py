@@ -24,14 +24,20 @@ class MultiHorizonHead(nn.Module):
 
     def __init__(self, d_model: int, n_horizons: int, hidden: Optional[int] = None,
                  pooling: str = "last_mean", dropout: float = 0.0,
-                 quantiles: Optional[Sequence[float]] = None) -> None:
+                 quantiles: Optional[Sequence[float]] = None,
+                 d_extra: int = 0) -> None:
         super().__init__()
         if pooling not in ("last", "mean", "last_mean"):
             raise ValueError(f"unknown pooling {pooling!r}")
         self.pooling = pooling
         self.n_horizons = n_horizons
         self.quantiles = list(quantiles) if quantiles else []
-        in_dim = d_model * (2 if pooling == "last_mean" else 1)
+        # d_extra is the planned-action embedding, when a run opted into one. It
+        # enters here, at the single point every architecture shares, so that the
+        # future-covariate comparison is not confounded by *where* the
+        # information was injected.
+        self.d_extra = d_extra
+        in_dim = d_model * (2 if pooling == "last_mean" else 1) + d_extra
         hidden = hidden or max(d_model, 64)
         n_out = n_horizons * (1 + len(self.quantiles))
         self.net = nn.Sequential(
@@ -51,8 +57,13 @@ class MultiHorizonHead(nn.Module):
             return seq.mean(dim=1)
         return torch.cat([seq[:, -1], seq.mean(dim=1)], dim=-1)
 
-    def forward(self, seq: torch.Tensor):
-        out = self.net(self.pool(seq))
+    def forward(self, seq: torch.Tensor, extra: Optional[torch.Tensor] = None):
+        pooled = self.pool(seq)
+        if self.d_extra:
+            if extra is None:
+                raise ValueError("head was built with d_extra but got no extra input")
+            pooled = torch.cat([pooled, extra], dim=-1)
+        out = self.net(pooled)
         point = out[:, :self.n_horizons]
         if not self.quantiles:
             return point, None

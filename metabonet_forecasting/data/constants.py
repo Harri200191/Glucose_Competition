@@ -153,6 +153,26 @@ MODALITY_CHANNELS: Dict[str, List[str]] = {
     "activity": ["act_heartrate", "act_heartrate_mask", "act_steps", "act_steps_mask"],
 }
 
+# --------------------------------------------------- future (planned) actions
+# Channels that may be read from *after* the anchor when a run explicitly opts in.
+#
+# This is off by default and must stay off by default. Reading these turns the
+# task from forecasting ("given what is known now, what will glucose be?") into
+# intervention-conditioned prediction ("given that this dose is delivered, what
+# will glucose be?"). Both are legitimate questions; they are not the same
+# question and their numbers are not comparable.
+#
+# Read the results with this corpus in mind: 85.8% of rows are AID (closed-loop),
+# where delivery at t+k is computed by a control algorithm from the CGM at t+k.
+# Future insulin there is not a plan a patient made -- it is the target,
+# transformed. Only the raw per-slot values and their masks are exposed, never
+# the exponential exposures, which are causal accumulations of the past and have
+# no forward-looking definition.
+FUTURE_MODALITY_CHANNELS: Dict[str, List[str]] = {
+    "insulin": ["ins_basal", "ins_bolus", "ins_basal_mask", "ins_bolus_mask"],
+    "carbs": ["carb_grams", "carb_mask"],
+}
+
 # Channels that exist only because of stage-2 event/exposure feature engineering.
 # Turning them off is ablation D10 in the plan.
 EVENT_FEATURE_CHANNELS: List[str] = DERIVED_CHANNELS

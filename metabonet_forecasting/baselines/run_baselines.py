@@ -46,12 +46,19 @@ LAGS = (0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 18, 24, 36, 48, 72, 96, 144, 287)
 WINDOWS = (6, 12, 24, 48, 72, 288)
 
 
-def _gather(ds: WindowDataset, batch: int = 8192) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _gather(ds: WindowDataset, batch: int = 8192
+            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Raw (unnormalised) CGM/insulin/carb windows for the tabular baselines.
 
     Reads the store directly rather than going through ``__getitem__``: these
     models want physical units and no normalisation, and pulling whole blocks is
     an order of magnitude faster than per-item collation.
+
+    The fourth return value is the planned-action block from *after* the anchor,
+    or None when the run is causal. It exists so the tabular baselines can enter
+    the same comparison: a gradient-boosted tree given future carbohydrate and
+    insulin sums is precisely the recipe behind an implausible leaderboard score,
+    and it is more convincing to reproduce that than to argue about it.
     """
     store = ds.store
     rows = ds.rows[ds.indices]
@@ -59,15 +66,55 @@ def _gather(ds: WindowDataset, batch: int = 8192) -> Tuple[np.ndarray, np.ndarra
     ci = store.channel_index
     want = [ci["cgm"], ci["cgm_mask"], ci["ins_bolus"], ci["ins_basal"], ci["carb_grams"]]
     out = np.empty((rows.size, L, len(want)), dtype=np.float32)
+
+    n_f = ds.n_future
+    fut = np.zeros((rows.size, n_f, len(want)), dtype=np.float32) if n_f else None
+    seg_end = ds.seg_end if n_f else None
+
     for start in range(0, rows.size, batch):
         chunk = rows[start:start + batch]
         for i, row in enumerate(chunk):
             out[start + i] = store.channels[row - L + 1: row + 1][:, want]
+    if n_f:
+        for i, (row, ai) in enumerate(zip(rows, ds.indices)):
+            usable = int(min(n_f, max(int(seg_end[ai]) - row - 1, 0)))
+            if usable > 0:
+                fut[i, :usable] = store.channels[row + 1: row + 1 + usable][:, want]
     y = np.asarray(store.targets[ds.indices][:, ds.horizon_ids], dtype=np.float32)
-    return out, y, ds.indices
+    return out, y, ds.indices, fut
 
 
-def _features(block: np.ndarray, model: str) -> np.ndarray:
+def _future_features(fut: Optional[np.ndarray], modalities: Sequence[str]) -> List[np.ndarray]:
+    """Planned-action summaries: cumulative dose/carbs over the forecast span.
+
+    Deliberately the crudest possible encoding -- running sums at several
+    horizons -- because the point is to show how little effort it takes to buy an
+    implausible score once post-anchor rows are in reach.
+    """
+    if fut is None or not modalities:
+        return []
+    steps = fut.shape[1]
+    cuts = [c for c in (6, 12, 18, 24) if c <= steps] or [steps]
+    feats: List[np.ndarray] = []
+    channels: List[int] = []
+    if "insulin" in modalities:
+        channels += [2, 3]                       # bolus, basal
+    if "carbs" in modalities:
+        channels += [4]                          # carbs
+    for ch in channels:
+        for c in cuts:
+            feats.append(np.nansum(fut[:, :c, ch], axis=1))
+        # time to the first event inside the span, capped -- "a meal is coming
+        # soon" is different information from "a meal is coming eventually"
+        hit = fut[:, :, ch] > 0
+        first = np.where(hit.any(axis=1), hit.argmax(axis=1), steps).astype(np.float32)
+        feats.append(first)
+    return feats
+
+
+def _features(block: np.ndarray, model: str,
+              fut: Optional[np.ndarray] = None,
+              future_modalities: Sequence[str] = ()) -> np.ndarray:
     """Lagged CGM (+ optional dose/carb sums) as a design matrix."""
     L = block.shape[1]
     cgm = block[..., 0]
@@ -89,6 +136,7 @@ def _features(block: np.ndarray, model: str) -> np.ndarray:
             for w in WINDOWS:
                 if w <= L:
                     feats.append(np.nansum(block[:, L - w:, ch], axis=1))
+    feats.extend(_future_features(fut, future_modalities))
     X = np.stack(feats, axis=1).astype(np.float32)
     return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -128,7 +176,13 @@ def run(cfg, model: str, run_dir: Path, seed: int = 0) -> Path:
     bundle = build_data(cfg)
     horizons = list(bundle.spec.horizons_min)
 
-    test_block, y_test, test_idx = _gather(bundle.datasets["test"])
+    future_modalities = list(bundle.spec.future_modalities)
+    if future_modalities:
+        log.info(f"planned future actions ENABLED: {future_modalities} over "
+                 f"{bundle.spec.n_future_steps()} steps -- this is "
+                 f"intervention-conditioned prediction, not forecasting")
+
+    test_block, y_test, test_idx, test_future = _gather(bundle.datasets["test"])
     cgm_now = test_block[:, -1, 0]
 
     if model == "persistence":
@@ -145,9 +199,9 @@ def run(cfg, model: str, run_dir: Path, seed: int = 0) -> Path:
         pred = cgm_now[:, None] + slope[:, None] * np.array(horizons, dtype=np.float32)[None, :]
         pred = np.clip(pred, K.CGM_REPORT_LO, K.CGM_REPORT_HI)
     else:
-        train_block, y_train, _ = _gather(bundle.datasets["train"])
-        Xtr = _features(train_block, model)
-        Xte = _features(test_block, model)
+        train_block, y_train, _, train_future = _gather(bundle.datasets["train"])
+        Xtr = _features(train_block, model, train_future, future_modalities)
+        Xte = _features(test_block, model, test_future, future_modalities)
         log.info(f"design matrix: train {Xtr.shape}, test {Xte.shape}")
         pred = _fit_predict(model, Xtr, y_train, Xte, seed, log)
 
@@ -170,6 +224,7 @@ def run(cfg, model: str, run_dir: Path, seed: int = 0) -> Path:
         "config": cfg.to_dict(),
         "data": bundle.summary(),
         "model": {"class": model, "backbone": model, "fusion": "tabular",
+                  "future_covariates": bool(future_modalities),
                   "parameters": None, "receptive_field": bundle.spec.context},
         "provenance": provenance(),
     })

@@ -13,6 +13,12 @@
 #
 # Cost: minutes for persistence and linear trend, ~1-3 h for GBDT on 400k windows.
 
+#
+# Planned future actions (off by default):
+#   FUTURE=insulin|carbs|both  expose post-anchor insulin/carbs to the model.
+#   Runs get a _futins/_futcarb/_futboth name suffix and are a DIFFERENT task
+#   from the causal benchmark -- see scripts/lib/common.sh.
+
 source "$(dirname "$0")/lib/common.sh"
 require_store
 queue_init

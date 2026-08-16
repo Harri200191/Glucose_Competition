@@ -24,6 +24,17 @@ data:
   missing_policy: zero         # zero | ffill | learned
   target_mode: delta           # predict the change from the last reading
 
+  # Planned future actions. EMPTY IS THE BENCHMARK -- leave it empty.
+  #
+  # Adding "insulin" and/or "carbs" lets the model read those channels from after
+  # the anchor. That answers a different question ("given this dose, what
+  # happens?") and its numbers are not comparable with any causal run. In this
+  # corpus 85.8% of rows are closed-loop, where insulin at t+k is computed by an
+  # algorithm from the CGM at t+k, so future insulin is largely the label in
+  # disguise. Enable it only to measure that effect, never for a headline result.
+  future_modalities: []        # [] | [insulin] | [carbs] | [insulin, carbs]
+  future_steps: null           # null = out to the longest horizon
+
   split:
     scheme: official           # official | subject_kfold | loso
     val_frac: 0.12
