@@ -1,0 +1,6 @@
+# Stage D rung 1 (plan 5.1): normalised channels concatenated per time step and
+# projected once. The required comparator -- it answers whether the encoders and
+# the conditioning are necessary at all.
+model:
+  fusion:
+    name: raw_concat

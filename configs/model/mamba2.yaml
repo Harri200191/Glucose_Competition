@@ -1,0 +1,17 @@
+# Mamba-2 backbone. use_kernels stays false: the official CUDA kernels need
+# Ampere-class hardware, and the pure-PyTorch SSD scan in models/mamba2.py is
+# tested against an explicit recurrence.
+include: [base]
+
+model:
+  d_model: 128
+  backbone:
+    name: mamba2
+    n_layers: 4
+    d_state: 64
+    d_conv: 4
+    expand: 2
+    headdim: 32
+    chunk_size: 24        # divides every context in the study grid (24..288)
+    dropout: 0.1
+    use_kernels: false

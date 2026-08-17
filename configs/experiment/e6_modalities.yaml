@@ -1,0 +1,5 @@
+# E6 -- modality ablations, read around meals and correction boluses.
+# Question: which modality carries the improvement, and in which event context?
+# Evaluation splits by postprandial / post-bolus / quiet automatically, so this
+# experiment is a set of training runs plus the standard stratified scoring.
+include: [base, model/mamba2, fusion/film, data/core]

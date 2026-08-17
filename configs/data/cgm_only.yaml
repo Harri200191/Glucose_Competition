@@ -1,0 +1,3 @@
+# Stage E rung 1: CGM alone. The floor for "does multimodal information help?"
+data:
+  modalities: [cgm]

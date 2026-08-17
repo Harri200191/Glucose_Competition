@@ -1,0 +1,3 @@
+# The core benchmark modality set: CGM + insulin + carbohydrate.
+data:
+  modalities: [cgm, insulin, carbs]

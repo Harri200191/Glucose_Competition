@@ -1,0 +1,7 @@
+# Sensitivity analysis (plan 4.5, 12): add source-dataset identity as a static
+# covariate and measure how much accuracy depends on knowing which study a
+# patient came from. Never part of the primary model.
+include: [base, model/mamba2, fusion/film, data/core]
+
+data:
+  use_source_identity: true

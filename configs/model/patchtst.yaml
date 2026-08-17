@@ -1,0 +1,17 @@
+# PatchTST backbone over the fused latent sequence.
+# patch_len 16 at a 5-minute grid = 80-minute tokens; 288 steps -> 18 tokens.
+include: [base]
+
+model:
+  d_model: 128
+  backbone:
+    name: patchtst
+    patch_len: 16
+    stride: 16
+    n_layers: 3
+    n_heads: 8
+    dropout: 0.1
+    causal_attention: true
+
+training:
+  lr: 0.0005

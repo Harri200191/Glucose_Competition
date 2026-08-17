@@ -1,0 +1,22 @@
+# Points every experiment at the small store and shrinks everything so a full
+# train -> predict -> score cycle finishes in a couple of minutes on one GPU.
+# Used by scripts/02_smoke_test.sh; never report numbers from it.
+data:
+  store: artifacts/store/smoke
+  context: 96
+  sampling:
+    max_train_windows: 20000
+    max_val_windows: 4000
+    max_test_windows: 8000
+    standardizer_sample: 20000
+  loader:
+    batch_size: 64
+    num_workers: 2
+    prefetch_factor: 2
+
+training:
+  epochs: 2
+  patience: 2
+  warmup_steps: 20
+  max_steps_per_epoch: 60
+  log_every: 20

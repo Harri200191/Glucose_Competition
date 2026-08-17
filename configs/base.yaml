@@ -1,0 +1,93 @@
+# Base configuration. Every experiment includes this and overrides a few keys.
+# Nothing here is a hidden default: modules raise if a key they need is absent.
+
+seed: 0
+
+data:
+  # Sequence store built by: python -m metabonet_forecasting.data.prepare
+  store: artifacts/store/main
+
+  context: 288                 # lattice steps of history (5 min each): 288 = 24 h
+  # Train and score all four. 30/60/120 are the paper's primary horizons; 90 is
+  # carried because the public benchmark scores it, and a horizon that is not in
+  # this list is never trained, never predicted and never scored -- the store
+  # holds its targets, but nothing reads them. One extra horizon costs one output
+  # unit and no extra data, so there is no reason to leave it out.
+  horizons_min: [30, 60, 90, 120]
+  modalities: [cgm, insulin, carbs]
+
+  use_event_features: true     # decay kernels + time-since-event (ablation D10)
+  use_masks: true              # per-variable observation masks (ablation D11)
+  use_static: true
+  use_source_identity: false   # cohort id as a static: shortcut risk, off by default
+  use_time_features: true
+  missing_policy: zero         # zero | ffill | learned
+  target_mode: delta           # predict the change from the last reading
+
+  # Planned future actions. EMPTY IS THE BENCHMARK -- leave it empty.
+  #
+  # Adding "insulin" and/or "carbs" lets the model read those channels from after
+  # the anchor. That answers a different question ("given this dose, what
+  # happens?") and its numbers are not comparable with any causal run. In this
+  # corpus 85.8% of rows are closed-loop, where insulin at t+k is computed by an
+  # algorithm from the CGM at t+k, so future insulin is largely the label in
+  # disguise. Enable it only to measure that effect, never for a headline result.
+  future_modalities: []        # [] | [insulin] | [carbs] | [insulin, carbs]
+  future_steps: null           # null = out to the longest horizon
+
+  split:
+    scheme: official           # official | subject_kfold | loso
+    val_frac: 0.12
+    seed: 0
+
+  sampling:
+    train_stride: 1            # extra thinning on top of the store's anchor stride
+    max_train_windows: 2000000
+    max_val_windows: 150000
+    max_test_windows: 400000
+    standardizer_sample: 200000
+    seed: 0
+
+  loader:
+    batch_size: 256
+    num_workers: 8
+    prefetch_factor: 4
+    pin_memory: true
+    persistent_workers: true
+
+model:
+  d_model: 128
+  d_static: 32
+  d_time: 16
+  static_emb_dim: 8
+  encoder:
+    dropout: 0.1
+    cgm_differences: false
+    driver_kernel: 3
+    missing_embedding: false
+  fusion:
+    name: film                 # raw_concat | concat | gated | film
+    dropout: 0.1
+  backbone:
+    name: tcn
+  head:
+    pooling: last_mean
+    dropout: 0.1
+
+training:
+  device: cuda
+  epochs: 20
+  lr: 0.001
+  weight_decay: 0.0001
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  accumulate_grad_batches: 1
+  amp: true
+  patience: 5
+  warmup_steps: 500
+  min_lr_frac: 0.05
+  deterministic: false
+  log_every: 500
+  loss:
+    name: huber
+    delta: 1.0

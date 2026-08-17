@@ -1,8 +1,24 @@
-.venv
+# data and build products
 /data
-.ipynb_checkpoints
-notebooks/data copy.ipynb
-/build
-__pycache__
+/artifacts
 /runs
+/results
+/figures
 /logs
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.ipynb_checkpoints/
+
+# editors
+.vscode/
+.idea/
+
+# legacy artefacts from the previous competition pipeline (kept on disk, on master)
+/build
+/notebooks
+/t.bash
+/viz_results.py

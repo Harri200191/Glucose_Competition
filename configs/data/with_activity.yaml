@@ -1,0 +1,5 @@
+# Optional extension (plan 4.4): heart rate and steps exist in a minority of
+# cohorts, so this set is reported separately and never as the core benchmark.
+# Their masks are what make the cohorts without them interpretable to the model.
+data:
+  modalities: [cgm, insulin, carbs, activity]

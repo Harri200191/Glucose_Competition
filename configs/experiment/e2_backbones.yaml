@@ -1,0 +1,8 @@
+# E2 -- controlled backbone comparison with raw concatenation.
+# Question: how much of the difference between TCN, PatchTST and Mamba-2 is the
+# backbone, with the input representation held fixed at the simplest setting?
+# Vary only model.backbone.name on the command line.
+include: [base, data/core, fusion/raw_concat]
+
+data:
+  context: 288

@@ -1,0 +1,22 @@
+# E9 -- what does knowing the future intervention buy, and is it real?
+#
+# NOT part of the benchmark. Reading insulin or carbohydrate values from after
+# the anchor turns forecasting ("given what is known now") into
+# intervention-conditioned prediction ("given that this dose is delivered").
+# Both are legitimate questions; only the first is a forecast, and their numbers
+# do not belong in the same table.
+#
+# This config on its own is still causal -- future_modalities is empty. The
+# sweep script sets it per arm, so the causal reference and the three exposed
+# arms differ in exactly one thing.
+#
+#   scripts/35_future_covariates.sh
+#
+# Interpretation, before you look: 85.8% of this corpus is closed-loop, where
+# insulin at t+k is computed from the CGM at t+k. A large insulin-arm gain is
+# the label leaking backwards, not a model that understands pharmacology.
+include: [base, model/mamba2, data/core, fusion/film]
+
+data:
+  future_modalities: []
+  future_steps: null      # null = out to the longest horizon (120 min = 24 steps)

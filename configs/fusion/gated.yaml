@@ -1,0 +1,5 @@
+# Stage D rung 3: learned per-modality gates before concatenation, so the network
+# can suppress a modality when context makes it uninformative.
+model:
+  fusion:
+    name: gated

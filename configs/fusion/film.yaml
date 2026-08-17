@@ -1,0 +1,8 @@
+# Stage D rung 4 and the proposed model: CGM-centred FiLM conditioning. Drivers
+# form a context that scales and shifts the CGM state embedding.
+# driver_concat keeps a compact driver projection alongside the modulated state;
+# set it false for the pure form.
+model:
+  fusion:
+    name: film
+    driver_concat: true

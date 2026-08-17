@@ -1,0 +1,15 @@
+# TiDE: the efficiency / complexity control. Dense encoder-decoder, no attention,
+# no recurrence, plus a global linear residual from the lookback CGM.
+include: [base]
+
+model:
+  fusion:
+    name: native
+  backbone:
+    name: tide
+    d_hidden: 256
+    d_decoder: 32
+    n_encoder_layers: 2
+    n_decoder_layers: 2
+    temporal_width: 4
+    dropout: 0.1
