@@ -1,0 +1,25 @@
+# Near-canonical PatchTST: channel-independent patching, overlapping patches, and
+# the native flatten-all-patches head. See models/patchtst_native.py for how this
+# differs from configs/model/patchtst.yaml, which patches the fused latent.
+#
+# fusion.name must be "native": this model does its own variable handling, and the
+# whole point is that the channels are NOT mixed before the backbone.
+include: [base]
+
+model:
+  d_model: 128
+  fusion:
+    name: native
+  backbone:
+    name: patchtst_native
+    patch_len: 16
+    stride: 8            # 50% overlap, as the paper uses; 16 would be non-overlapping
+    n_layers: 3
+    n_heads: 8
+    d_head: 32           # per-channel width after the flatten head
+    d_mix: 128           # width of the cross-channel mixer
+    dropout: 0.1
+    instance_norm: false # RevIN-style per-instance scaling; off by default
+
+training:
+  lr: 0.0005
