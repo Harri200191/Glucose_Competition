@@ -22,3 +22,9 @@ __pycache__/
 /notebooks
 /t.bash
 /viz_results.py
+
+
+scripts/analysis
+/docs
+
+t*.bash
