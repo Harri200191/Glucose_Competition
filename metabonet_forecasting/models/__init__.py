@@ -15,10 +15,12 @@ from . import fusion                                     # noqa: F401  (registra
 from .frontend import FrontEndForecaster
 from .tft import TFTForecaster
 from .tide import TiDEForecaster
+from .patchtst_native import PatchTSTNativeForecaster
 
 # Architectures that arrange their own internals instead of using the common
 # front end, because their variable handling is the thing under test.
-NATIVE_MODELS = {"tft": TFTForecaster, "tide": TiDEForecaster}
+NATIVE_MODELS = {"tft": TFTForecaster, "tide": TiDEForecaster,
+                 "patchtst_native": PatchTSTNativeForecaster}
 
 
 def build_model(cfg: Config, shapes: Dict) -> ForecastModel:

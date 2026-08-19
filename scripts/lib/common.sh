@@ -200,6 +200,13 @@ _ACQUIRED_GPU=""
 _acquire_gpu() {
   local waited=0
   _ACQUIRED_GPU=""
+  # A caller that forgot queue_init has an empty device list while $GPUS names
+  # real cards. Falling through to the CPU path there is silent and wrong: the
+  # child inherits every device, torch takes cuda:0 regardless of who is on it,
+  # and the sweep serialises. Fail loudly instead.
+  if (( ${#_gpu_ids[@]} == 0 )) && [[ -n "$GPUS" ]]; then
+    die "queue not initialised: GPUS=[$GPUS] but no devices registered. Call queue_init before the first queue_run/train."
+  fi
   if (( ${#_gpu_ids[@]} == 0 )); then          # CPU: strictly one at a time
     while _reap; (( ${#_slot_pid[@]} >= 1 )); do sleep 5; done
     _ACQUIRED_GPU="cpu"; return 0
