@@ -16,6 +16,7 @@ retraining anything.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import time
@@ -54,7 +55,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="write predictions but skip scoring")
     ap.add_argument("--predict-val", action="store_true",
                     help="also write predictions for the validation split")
+    ap.add_argument("--gpu", default=None,
+                    help="physical GPU index to train on, e.g. --gpu 6. Masks every other "
+                         "device via CUDA_VISIBLE_DEVICES before torch initialises CUDA, so "
+                         "no context is created on cards belonging to someone else. "
+                         "Equivalent to CUDA_VISIBLE_DEVICES=6 in the environment; use "
+                         "--set training.device=cpu to force CPU instead.")
     a = ap.parse_args(argv)
+
+    # Must happen before the first CUDA call. torch may already be imported --
+    # that is fine, the context is created lazily -- but it must not have touched
+    # a device yet, so keep this at the top of main().
+    if a.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(a.gpu)
 
     cfg = load_config(a.config, a.sets)
     seed = int(cfg.get("seed", 0))

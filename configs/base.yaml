@@ -83,7 +83,10 @@ training:
   grad_clip: 1.0
   accumulate_grad_batches: 1
   amp: true
-  patience: 5
+  patience: 5                  # epochs without a *significant* val-RMSE gain before stopping
+  min_delta: 0.0               # mg/dL of val RMSE that counts as a gain; 0.0 = any
+                               # improvement resets patience. Set ~0.02 to stop once
+                               # epochs stop buying anything measurable.
   warmup_steps: 500
   min_lr_frac: 0.05
   deterministic: false
