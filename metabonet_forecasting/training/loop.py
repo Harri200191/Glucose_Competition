@@ -49,10 +49,10 @@ class Trainer:
 
         loss_cfg = dict(t.get("loss", {"name": "huber"}))
         self.criterion = build_loss(loss_cfg)
-        self.quantile_loss = str(loss_cfg.get("name", "")).lower() == "quantile"
+        self.quantile_loss = str(loss_cfg.get("name", "")).lower() in ("quantile", "hybrid")
         if self.quantile_loss and not cfg.get_path("model.head.quantiles", None):
             raise ValueError(
-                "training.loss.name=quantile needs a quantile head; set "
+                "training.loss.name=quantile/hybrid needs a quantile head; set "
                 "model.head.quantiles=[0.1, 0.5, 0.9] to match")
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=float(t.get("lr", 1e-3)),
@@ -161,6 +161,7 @@ class Trainer:
         preds: List[np.ndarray] = []
         trues: List[np.ndarray] = []
         masks: List[np.ndarray] = []
+        quants: List[np.ndarray] = []
         for batch in loader:
             batch = batch_to_device(batch, self.device)
             with torch.amp.autocast(self.device.type, enabled=self.amp):
@@ -170,6 +171,12 @@ class Trainer:
             preds.append(pred_mgdl.cpu().numpy())
             trues.append(batch["y"].cpu().numpy())
             masks.append(batch["y_mask"].cpu().numpy())
+            if out.quantiles is not None:
+                q = torch.stack([
+                    std.inverse_targets(out.quantiles[..., k].float(),
+                                        batch["cgm_now"].float())
+                    for k in range(out.quantiles.shape[-1])], dim=-1)
+                quants.append(q.cpu().numpy())
 
         index = np.concatenate(idx)
         pred = np.concatenate(preds)
@@ -187,6 +194,13 @@ class Trainer:
         for j, h in enumerate(self.horizons):
             df[f"y_true_{h}"] = true[:, j]
             df[f"y_pred_{h}"] = pred[:, j]
+        if quants:
+            levels = list(self.cfg.get_path("model.head.quantiles", []) or [])
+            quant = np.concatenate(quants)
+            for j, h in enumerate(self.horizons):
+                for k, lv in enumerate(levels):
+                    df[f"y_q{int(round(lv * 100)):02d}_{h}"] = \
+                        np.where(mask[:, j] > 0, quant[:, j, k], np.nan)
         return df
 
     @torch.no_grad()

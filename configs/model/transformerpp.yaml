@@ -1,0 +1,15 @@
+# Modern decoder transformer backbone: RoPE + RMSNorm + SwiGLU, strictly
+# causal per-step attention over the 5-minute lattice (no patching).
+include: [base]
+
+model:
+  d_model: 128
+  backbone:
+    name: transformerpp
+    n_layers: 6
+    n_heads: 8
+    ffn_ratio: 2.67
+    dropout: 0.1
+
+training:
+  lr: 0.0005

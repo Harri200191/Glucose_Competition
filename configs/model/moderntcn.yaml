@@ -1,0 +1,13 @@
+# ModernTCN backbone (ICLR 2024), causal adaptation: large-kernel depthwise
+# convolutions + inverted-bottleneck FFN. Depth auto-sizes so the receptive
+# field covers the context (kernel 51 at context 288 -> 6 blocks, field 301).
+include: [base]
+
+model:
+  d_model: 128
+  backbone:
+    name: moderntcn
+    kernel_size: 51
+    ffn_ratio: 2
+    dropout: 0.1
+    auto_blocks: true

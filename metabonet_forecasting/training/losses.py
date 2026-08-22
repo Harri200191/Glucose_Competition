@@ -70,6 +70,30 @@ class QuantileLoss(nn.Module):
         return masked_mean(loss, mask)
 
 
+class HybridLoss(nn.Module):
+    """Huber on the point forecast + pinball on the quantiles.
+
+    Receives the quantile tensor ``[B, H, Q]``. The head constructs quantiles as
+    monotone offsets around the point forecast with the centre offset zero, so
+    the middle column *is* the point forecast — Huber on it trains the point
+    exactly as the plain loss would, while the pinball term shapes the rest of
+    the distribution. ``alpha`` weights the pinball term.
+    """
+
+    def __init__(self, quantiles: Sequence[float], delta: float = 1.0,
+                 alpha: float = 1.0) -> None:
+        super().__init__()
+        self.point = MaskedHuber(delta)
+        self.pinball = QuantileLoss(quantiles)
+        self.mid = len(list(quantiles)) // 2
+        self.alpha = alpha
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
+        return self.point(pred[..., self.mid], target, mask) \
+            + self.alpha * self.pinball(pred, target, mask)
+
+
 def build_loss(cfg: Dict) -> nn.Module:
     name = str(cfg.get("name", "huber")).lower()
     if name == "huber":
@@ -80,4 +104,8 @@ def build_loss(cfg: Dict) -> nn.Module:
         return MaskedMAE()
     if name == "quantile":
         return QuantileLoss(cfg.get("quantiles", [0.1, 0.5, 0.9]))
+    if name == "hybrid":
+        return HybridLoss(cfg.get("quantiles", [0.1, 0.5, 0.9]),
+                          float(cfg.get("delta", 1.0)),
+                          float(cfg.get("alpha", 1.0)))
     raise ValueError(f"unknown loss {name!r}")

@@ -1,0 +1,13 @@
+# xLSTM backbone (NeurIPS 2024): mLSTM matrix-memory blocks in the exact
+# parallel form. Exponential gating runs fp32 under AMP, like Mamba-2's scan.
+include: [base]
+
+model:
+  d_model: 128
+  backbone:
+    name: xlstm
+    n_layers: 4
+    n_heads: 4
+    expand: 2
+    d_conv: 4
+    dropout: 0.1
