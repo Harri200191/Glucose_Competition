@@ -63,18 +63,24 @@ class MLSTMLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, d = x.shape
         h, dh = self.n_heads, self.d_head
-        conv_x = F.silu(self.conv(x))
-        q = self.q_proj(conv_x).view(B, L, h, dh).transpose(1, 2)   # [B, h, L, dh]
-        k = self.k_proj(conv_x).view(B, L, h, dh).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, h, dh).transpose(1, 2)
-        gates = self.gate_proj(x)                                    # [B, L, 2h]
-        i_gate = gates[..., :h].transpose(1, 2)                      # [B, h, L]
-        f_gate = gates[..., h:].transpose(1, 2)
-
-        # Exponential gating is numerically alive only in fp32.
+        # The whole layer runs in fp32, projections included, for the same
+        # reason Mamba-2's scan does: exponential gating and a 288-step decay
+        # product are exactly what fp16 loses — a single overflowing activation
+        # in a half-precision projection poisons every step after it.
+        in_dtype = x.dtype
         with torch.autocast(device_type=x.device.type, enabled=False):
-            q32, k32, v32 = q.float(), k.float(), v.float()
-            log_f = F.logsigmoid(f_gate.float())                     # [B, h, L]
+            x = x.float()
+            conv_x = F.silu(self.conv(x))
+            q = self.q_proj(conv_x).view(B, L, h, dh).transpose(1, 2)  # [B, h, L, dh]
+            k = self.k_proj(conv_x).view(B, L, h, dh).transpose(1, 2)
+            v = self.v_proj(x).view(B, L, h, dh).transpose(1, 2)
+            gates = self.gate_proj(x)                                  # [B, L, 2h]
+            # Clamped: an input gate pushed past ~15 turns exp() into inf
+            # before the stabiliser can help.
+            i_gate = gates[..., :h].transpose(1, 2).clamp(-15.0, 15.0)  # [B, h, L]
+            f_gate = gates[..., h:].transpose(1, 2).clamp(-15.0, 15.0)
+            q32, k32, v32 = q, k, v
+            log_f = F.logsigmoid(f_gate)                               # [B, h, L]
             F_cum = torch.cumsum(log_f, dim=-1)
             # D̃[i, j] = F[i] - F[j] + ĩ[j], causal-masked.
             d_mat = F_cum.unsqueeze(-1) - F_cum.unsqueeze(-2) \
@@ -88,12 +94,14 @@ class MLSTMLayer(nn.Module):
                 torch.exp(-m))
             out = (scores / norm) @ v32                              # [B, h, L, dh]
 
-        out = out.to(x.dtype).transpose(1, 2).reshape(B, L, d)
-        # Headwise norm per time step: GroupNorm over [N, C] sees one position at
-        # a time. Feeding it [B, C, L] instead would pool statistics across the
-        # whole window and leak the future into the past.
-        out = self.out_norm(out.reshape(B * L, d)).reshape(B, L, d)
-        return self.out_proj(out)
+            out = out.transpose(1, 2).reshape(B, L, d)
+            # Headwise norm per time step: GroupNorm over [N, C] sees one
+            # position at a time. Feeding it [B, C, L] instead would pool
+            # statistics across the whole window and leak the future into the
+            # past.
+            out = self.out_norm(out.reshape(B * L, d)).reshape(B, L, d)
+            out = self.out_proj(out)
+        return out.to(in_dtype)
 
 
 class XLSTMBlock(nn.Module):

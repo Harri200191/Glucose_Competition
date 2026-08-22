@@ -11,7 +11,7 @@ from ..common.config import Config
 from ..common.registry import BACKBONES, FUSIONS
 from .base import ForecastModel, ForecastOutput, TemporalBackbone
 from . import tcn, patchtst, mamba2, recurrent          # noqa: F401  (registration)
-from . import moderntcn, xlstm, transformerpp            # noqa: F401  (registration)
+from . import moderntcn, xlstm, transformerpp, mambaformer  # noqa: F401  (registration)
 from . import fusion                                     # noqa: F401  (registration)
 from .frontend import FrontEndForecaster
 from .tft import TFTForecaster

@@ -11,3 +11,8 @@ model:
     expand: 2
     d_conv: 4
     dropout: 0.1
+
+# Exponential gating diverged to NaN at the base 1e-3 within the first epoch of
+# a full-scale run (smoke runs survived it). Half rate is stable.
+training:
+  lr: 0.0005

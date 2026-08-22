@@ -95,6 +95,14 @@ def test_transformerpp_backbone_is_causal():
     assert_causal(m, atol=1e-4)
 
 
+def test_mambaformer_backbone_is_causal():
+    from metabonet_forecasting.models.mambaformer import MambaFormerBackbone
+    m = MambaFormerBackbone(D, n_layers=3, attn_every=2, n_heads=2,
+                            d_state=16, headdim=8, chunk_size=8,
+                            dropout=0.0).eval()
+    assert_causal(m, atol=1e-4)
+
+
 def test_patchtst_backbone_is_causal_across_patches():
     """A patch may see all its own steps; it must not see a later patch."""
     p = PatchTSTBackbone(D, patch_len=8, stride=8, n_layers=2, n_heads=2, dropout=0.0,

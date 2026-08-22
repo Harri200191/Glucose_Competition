@@ -124,7 +124,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     preds = trainer.predict(test_loader)
     preds.to_parquet(run_dir / "predictions_test.parquet", index=False)
     log.info(f"wrote {len(preds):,} test predictions")
-    if a.predict_val:
+    if a.predict_val or bool(cfg.get_path("training.predict_val", False)):
         val_preds = trainer.predict(bundle.loader("val", cfg, shuffle=False))
         val_preds.to_parquet(run_dir / "predictions_val.parquet", index=False)
 

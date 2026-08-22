@@ -17,7 +17,7 @@ from metabonet_forecasting.models.mamba2 import ssd_chunked, ssd_recurrent_refer
 from metabonet_forecasting.data.windows import collate
 
 BACKBONES = ["tcn", "patchtst", "mamba2", "lstm", "tide", "tft",
-             "moderntcn", "xlstm", "transformerpp"]
+             "moderntcn", "xlstm", "transformerpp", "mambaformer"]
 
 
 # ------------------------------------------------------------------ SSD kernel
