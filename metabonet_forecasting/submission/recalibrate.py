@@ -56,26 +56,73 @@ def ensemble(files: List[Path], weights: Optional[List[float]]) -> pd.DataFrame:
     return out
 
 
-def fit_multipliers(pred: np.ndarray, ref: np.ndarray) -> List[float]:
-    """Per-bin grid search for the multiplier that maximises zone-A count."""
+ADDS = np.arange(-6.0, 6.01, 1.0)
+
+
+def fit_multipliers(pred: np.ndarray, ref: np.ndarray,
+                    affine: bool = False) -> List:
+    """Per-bin grid search maximising zone-A count.
+
+    ``affine=False``: one multiplier per bin (the baseline everyone uses).
+    ``affine=True``: (multiplier, offset) per bin — the offset matters most in
+    the hypo range, where a pure multiplier cannot push a 90 mg/dL prediction
+    below the narrow zone-A corridor without also distorting 200s.
+    """
     out = []
     for lo, hi in zip(EDGES[:-1], EDGES[1:]):
         sel = (pred >= lo) & (pred < hi) & np.isfinite(ref)
         if sel.sum() < 200:
-            out.append(1.0)
+            out.append((1.0, 0.0) if affine else 1.0)
             continue
         p, r = pred[sel], ref[sel]
-        counts = [zone_a_mask(p * m, r).sum() for m in MULTS]
-        out.append(float(MULTS[int(np.argmax(counts))]))
+        if affine:
+            best, arg = -1, (1.0, 0.0)
+            for add in ADDS:
+                counts = [zone_a_mask(p * m + add, r).sum() for m in MULTS]
+                k = int(np.argmax(counts))
+                if counts[k] > best:
+                    best, arg = counts[k], (float(MULTS[k]), float(add))
+            out.append(arg)
+        else:
+            counts = [zone_a_mask(p * m, r).sum() for m in MULTS]
+            out.append(float(MULTS[int(np.argmax(counts))]))
     return out
 
 
-def apply_multipliers(pred: np.ndarray, mult: List[float]) -> np.ndarray:
+def apply_multipliers(pred: np.ndarray, mult: List) -> np.ndarray:
     out = pred.copy()
     for (lo, hi), m in zip(zip(EDGES[:-1], EDGES[1:]), mult):
         sel = (pred >= lo) & (pred < hi)
-        out[sel] = pred[sel] * m
+        if isinstance(m, (tuple, list)):
+            out[sel] = pred[sel] * m[0] + m[1]
+        else:
+            out[sel] = pred[sel] * m
     return out
+
+
+def fit_weights(stack: np.ndarray, ref: np.ndarray, step: float = 0.05
+                ) -> np.ndarray:
+    """[M, N] member predictions -> simplex weights maximising zone-A of the
+    blend, by exhaustive grid over the simplex at ``step`` resolution."""
+    m = stack.shape[0]
+    ok = np.isfinite(ref)
+    s, r = stack[:, ok], ref[ok]
+    best_w, best = None, -1.0
+    ticks = int(round(1.0 / step))
+
+    def rec(prefix, remaining, slots):
+        nonlocal best_w, best
+        if slots == 1:
+            w = np.array(prefix + [remaining * step])
+            score = zone_a_mask(np.einsum("m,mn->n", w, s), r).mean()
+            if score > best:
+                best, best_w = score, w
+            return
+        for t in range(remaining + 1):
+            rec(prefix + [t * step], remaining - t, slots - 1)
+
+    rec([], ticks, m)
+    return best_w
 
 
 def main(argv=None) -> int:
@@ -90,25 +137,41 @@ def main(argv=None) -> int:
     ap.add_argument("--out-annual", type=Path, default=None)
     ap.add_argument("--no-recal", action="store_true",
                     help="ensemble only, skip the multiplier fit")
+    ap.add_argument("--fit-weights", action="store_true",
+                    help="fit per-horizon simplex weights on the targets "
+                         "instead of using fixed --weights")
+    ap.add_argument("--affine", action="store_true",
+                    help="fit (multiplier, offset) per bin instead of "
+                         "multiplier only")
     a = ap.parse_args(argv)
 
+    frames = [pd.read_parquet(f) for f in a.live]
     live = ensemble(a.live, a.weights)
     targets = pd.read_parquet(a.targets)
     if not (targets["id"].values == live["id"].values).all():
         raise SystemExit("targets do not align with the live template rows")
 
     fitted = {}
+    horizon_weights = {}
     for h in HORIZONS:
         col, tcol = f"pred_{h}", f"target_{h}"
         if col not in live.columns or live[col].isna().all():
             continue
-        pred = live[col].to_numpy(float)
         ref = targets[tcol].to_numpy(float)
+        if a.fit_weights and len(frames) > 1:
+            stack = np.stack([f[col].to_numpy(float) for f in frames])
+            w = fit_weights(stack, ref)
+            horizon_weights[h] = [round(float(x), 3) for x in w]
+            pred = np.einsum("m,mn->n", w, stack)
+            print(f"h={h:>3}: fitted weights {horizon_weights[h]}")
+        else:
+            pred = live[col].to_numpy(float)
         before = zone_a_mask(pred, ref).mean() * 100
         if a.no_recal:
             print(f"h={h:>3}: zone A {before:5.2f}% (no recal)")
+            live[col] = pred
             continue
-        mult = fit_multipliers(pred, ref)
+        mult = fit_multipliers(pred, ref, affine=a.affine)
         new = apply_multipliers(pred, mult)
         after = zone_a_mask(new, ref).mean() * 100
         rmse_b = float(np.sqrt(np.nanmean((pred - ref) ** 2)))
@@ -122,15 +185,22 @@ def main(argv=None) -> int:
     live.to_parquet(a.out_live, index=False)
     meta = {"members": [str(f) for f in a.live],
             "weights": a.weights or [1.0] * len(a.live),
-            "edges": EDGES, "mult": fitted}
+            "horizon_weights": horizon_weights,
+            "edges": EDGES, "affine": a.affine, "mult": fitted}
     a.out_live.with_suffix(".recal.json").write_text(json.dumps(meta, indent=1))
     print(f"wrote {a.out_live}")
 
     if a.annual:
+        ann_frames = [pd.read_parquet(f) for f in a.annual]
         ann = ensemble(a.annual, a.weights)
         for h, mult in fitted.items():
             col = f"pred_{h}"
             if col in ann.columns and ann[col].notna().any():
+                if h in horizon_weights:
+                    stack = np.stack([f[col].to_numpy(float)
+                                      for f in ann_frames])
+                    ann[col] = np.einsum(
+                        "m,mn->n", np.asarray(horizon_weights[h]), stack)
                 ann[col] = apply_multipliers(ann[col].to_numpy(float), mult)
         out_ann = a.out_annual or a.out_live.parent / a.out_live.name.replace(
             "live_", "annual_")
