@@ -26,7 +26,7 @@ from .base import ForecastModel, ForecastOutput
 from .encoders import (FutureActionEncoder, StaticEncoder, TimeEncoder,
                        build_modality_encoders)
 from .fusion import build_fusion
-from .heads import MultiHorizonHead
+from .heads import HorizonCrossHead, MultiHorizonHead
 
 
 def _build_future_encoder(shapes: Dict, model_cfg: Dict,
@@ -91,19 +91,33 @@ class FrontEndForecaster(ForecastModel):
             self.input_proj = None
 
         # --- stages 4 and 5 ---------------------------------------------------
-        # Planned future actions, only if this run asked for them.
-        self.future_encoder = _build_future_encoder(shapes, model_cfg, encoder_cfg)
-        d_extra = self.future_encoder.d_out if self.future_encoder is not None else 0
-
         backbone_name = str(backbone_cfg.pop("name", "tcn"))
         backbone_cfg.setdefault("context", self.context)
         self.backbone = BACKBONES.build(backbone_name, d_model=d_model, **backbone_cfg)
         self.backbone_name = backbone_name
-        self.head = MultiHorizonHead(
-            d_model, self.n_horizons, hidden=head_cfg.get("hidden"),
-            pooling=str(head_cfg.get("pooling", "last_mean")),
-            dropout=float(head_cfg.get("dropout", 0.0)),
-            quantiles=head_cfg.get("quantiles"), d_extra=d_extra)
+
+        self.head_name = str(head_cfg.get("name", "pooled"))
+        if self.head_name == "horizon_cross":
+            # The cross-attention decoder consumes the raw future block itself
+            # (one token per future slot), so no flat future encoder is built.
+            self.future_encoder = None
+            self.head = HorizonCrossHead(
+                d_model, self.n_horizons,
+                future_steps=int(shapes.get("future_steps", 0) or 0),
+                future_channels=int(shapes.get("future_channels", 0) or 0),
+                n_heads=int(head_cfg.get("n_heads", 4)),
+                n_layers=int(head_cfg.get("n_layers", 2)),
+                dropout=float(head_cfg.get("dropout", 0.0)),
+                quantiles=head_cfg.get("quantiles"))
+        else:
+            # Planned future actions, only if this run asked for them.
+            self.future_encoder = _build_future_encoder(shapes, model_cfg, encoder_cfg)
+            d_extra = self.future_encoder.d_out if self.future_encoder is not None else 0
+            self.head = MultiHorizonHead(
+                d_model, self.n_horizons, hidden=head_cfg.get("hidden"),
+                pooling=str(head_cfg.get("pooling", "last_mean")),
+                dropout=float(head_cfg.get("dropout", 0.0)),
+                quantiles=head_cfg.get("quantiles"), d_extra=d_extra)
 
     # ---------------------------------------------------------------- forward
     def forward(self, batch: Dict[str, torch.Tensor]) -> ForecastOutput:
@@ -128,9 +142,12 @@ class FrontEndForecaster(ForecastModel):
             z = self.fusion(encoded, static=static, time=time)
 
         seq = self.backbone(z)
-        future = (self.future_encoder(batch["x_future"])
-                  if self.future_encoder is not None else None)
-        point, quantiles = self.head(seq, future)
+        if self.head_name == "horizon_cross":
+            point, quantiles = self.head(seq, batch.get("x_future"))
+        else:
+            future = (self.future_encoder(batch["x_future"])
+                      if self.future_encoder is not None else None)
+            point, quantiles = self.head(seq, future)
         return ForecastOutput(pred_norm=point, quantiles=quantiles)
 
     # ------------------------------------------------------------------ meta
@@ -140,7 +157,10 @@ class FrontEndForecaster(ForecastModel):
     def describe(self) -> Dict[str, object]:
         d = super().describe()
         d.update({"backbone": self.backbone_name, "fusion": self.fusion_name,
+                  "head": self.head_name,
                   "d_model": self.d_model, "modalities": self.modalities,
                   "context": self.context,
-                  "future_covariates": self.future_encoder is not None})
+                  "future_covariates": self.future_encoder is not None
+                  or (self.head_name == "horizon_cross"
+                      and getattr(self.head, "future_proj", None) is not None)})
         return d

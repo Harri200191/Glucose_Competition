@@ -1,0 +1,19 @@
+# MambaFormer: Mamba-2 recurrence with an attention layer every third layer
+# (Jamba/Samba recipe). Upgrades the benchmark's best backbone with
+# content-based retrieval over specific past events.
+include: [base]
+
+model:
+  d_model: 128
+  backbone:
+    name: mambaformer
+    n_layers: 6
+    attn_every: 3
+    n_heads: 8
+    ffn_ratio: 2.67
+    d_state: 64
+    d_conv: 4
+    expand: 2
+    headdim: 32
+    chunk_size: 24
+    dropout: 0.1

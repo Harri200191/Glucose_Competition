@@ -143,14 +143,22 @@ def predict_template(run_dir: Path, store_root: Path, template_path: Path,
 
     preds: List[np.ndarray] = []
     index: List[np.ndarray] = []
+    quants: List[np.ndarray] = []
     for batch in loader:
         batch = batch_to_device(batch, dev)
         out = model(batch)
         mgdl = std.inverse_targets(out.pred_norm.float(), batch["cgm_now"].float())
         preds.append(mgdl.cpu().numpy())
         index.append(batch["index"].cpu().numpy())
+        if out.quantiles is not None:
+            q = torch.stack([
+                std.inverse_targets(out.quantiles[..., k].float(),
+                                    batch["cgm_now"].float())
+                for k in range(out.quantiles.shape[-1])], dim=-1)
+            quants.append(q.cpu().numpy())
 
     pred = np.concatenate(preds)
+    quant = np.concatenate(quants) if quants else None
     anchor_index = np.concatenate(index)
     # Back to template order: the dataset walks anchors in store order, and the
     # store's anchor table carries the template row each one came from.
@@ -169,7 +177,21 @@ def predict_template(run_dir: Path, store_root: Path, template_path: Path,
         out[col] = values
 
     _validate(out, template, spec)
-    return out
+
+    # Side table of quantiles for the decision layer. NEVER uploaded: the
+    # submission file must match the template's columns exactly, so anything
+    # extra lives next to it in its own file, aligned by template row order.
+    side = None
+    if quant is not None:
+        levels = list(cfg.get_path("model.head.quantiles", []) or [])
+        side = pd.DataFrame({"id": template["id"].to_numpy()})
+        for j, h in enumerate(spec.horizons_min):
+            for k, lv in enumerate(levels):
+                values = np.full(len(template), np.nan, dtype=np.float64)
+                values[template_row] = np.clip(
+                    quant[:, j, k], K.CGM_REPORT_LO, K.CGM_REPORT_HI)
+                side[f"q{int(round(lv * 100)):02d}_{h}"] = values
+    return out, side
 
 
 def _validate(out: pd.DataFrame, template: pd.DataFrame, spec: WindowSpec) -> None:
@@ -214,11 +236,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--num-workers", type=int, default=4)
     a = ap.parse_args(argv)
 
-    out = predict_template(Path(a.run), Path(a.store), Path(a.template),
-                           a.device, a.batch_size, a.num_workers)
+    out, side = predict_template(Path(a.run), Path(a.store), Path(a.template),
+                                 a.device, a.batch_size, a.num_workers)
     dest = Path(a.out)
     dest.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(dest, index=False)
+    if side is not None:
+        side_path = dest.with_suffix("").with_name(dest.stem + ".quantiles.parquet")
+        side.to_parquet(side_path, index=False)
+        LOG.info(f"wrote quantile side table {side_path}")
 
     described = {f"pred_{h}": (round(float(out[f'pred_{h}'].mean()), 2)
                                if out[f"pred_{h}"].notna().any() else None)

@@ -73,6 +73,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                            "-- only the submission means anything. Maximises the live "
                            "leaderboard, tells you nothing about the annual holdout.")
     ap.set_defaults(live_policy=None)
+    ap.add_argument("--init-from", default=None,
+                    help="path to a best.pt checkpoint to warm-start the model weights "
+                         "from. The config must build an identical architecture; the "
+                         "optimiser and schedule start fresh.")
     ap.add_argument("--gpu", default=None,
                     help="physical GPU index to train on, e.g. --gpu 6. Masks every other "
                          "device via CUDA_VISIBLE_DEVICES before torch initialises CUDA, so "
@@ -107,6 +111,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              f"context={bundle.spec.context}  horizons={bundle.spec.horizons_min}")
 
     model = build_model(cfg, shapes)
+    if a.init_from:
+        blob = torch.load(a.init_from, map_location="cpu", weights_only=False)
+        model.load_state_dict(blob["state_dict"])
+        log.info(f"warm-started weights from {a.init_from} "
+                 f"(meta: {json.dumps(blob.get('meta', {}), default=str)})")
     log.info(f"model: {json.dumps(model.describe(), default=str)}")
     rf = model.receptive_field()
     if rf is not None and rf < bundle.spec.context:
@@ -135,7 +144,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     preds = trainer.predict(test_loader)
     preds.to_parquet(run_dir / "predictions_test.parquet", index=False)
     log.info(f"wrote {len(preds):,} test predictions")
-    if a.predict_val:
+    if a.predict_val or bool(cfg.get_path("training.predict_val", False)):
         val_preds = trainer.predict(bundle.loader("val", cfg, shuffle=False))
         val_preds.to_parquet(run_dir / "predictions_val.parquet", index=False)
 
