@@ -19,6 +19,8 @@ from . import constants as K
 from . import splits as S
 from .store import SequenceStore
 from .transforms import Standardizer, fit_standardizer
+
+LOG = get_console_logger("metabonet")
 from .windows import WindowDataset, WindowSpec, collate
 
 
@@ -104,7 +106,14 @@ def build_data(cfg: Config, standardizer: Optional[Standardizer] = None) -> Data
 
     sp = dict(d.get("split", {}))
     scheme = sp.pop("scheme", "official")
+    policy = sp.pop("live_policy", None)
+    if sp.pop("exclude_live", False) and policy is None:   # older alias
+        policy = "exclude"
+    live_store = sp.pop("live_store",
+                        str(REPO_ROOT / "artifacts" / "store" / "submission_live"))
     split = S.make_split(store, scheme, **sp)
+    split, note = S.apply_live_policy(store, split, policy, live_store)
+    LOG.info(note)
     strata = S.test_strata(store, split)
 
     sampling = dict(d.get("sampling", {}))
