@@ -17,7 +17,9 @@ of the data.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -110,6 +112,96 @@ def make_split(store: SequenceStore, scheme: str, **kw) -> Dict[str, np.ndarray]
         raise ValueError(f"unknown split scheme {scheme!r}")
     assert_no_subject_overlap(store, split, allow_train_test=(scheme == "official"))
     return split
+
+
+# ------------------------------------------------ competition-subject policies
+def _subject_keys(store: SequenceStore) -> pd.DataFrame:
+    """``(cohort, pid)`` per store subject -- the only identity that survives
+    across stores.
+
+    ``subject`` is a per-store row index and means nothing outside the store that
+    minted it. ``cohort`` and ``pid`` are codes against the vocabularies built
+    while reading the corpus, so two stores prepared from the *same* corpus file
+    agree on them. Two stores built from different corpora do not, which is why
+    :func:`competition_subject_mask` refuses to compare them.
+    """
+    subs = pd.read_parquet(store.root / "subjects.parquet")
+    return subs[["subject", "cohort", "pid"]]
+
+
+def competition_subject_mask(store: SequenceStore,
+                             other_store_root: os.PathLike) -> np.ndarray:
+    """Anchors of ``store`` whose patient also appears in ``other_store``."""
+    root = Path(other_store_root)
+    if not (root / "subjects.parquet").exists():
+        raise SplitError(
+            f"no subject table at {root}. Build the store first, e.g. "
+            f"scripts/90_make_submission.sh, which runs prepare.py with "
+            f"--anchors-from the competition template.")
+
+    other = SequenceStore(root)
+    mine, theirs = _subject_keys(store), _subject_keys(other)
+    if (store.manifest.get("levels", {}).get("source_file", [])
+            != other.manifest.get("levels", {}).get("source_file", [])):
+        raise SplitError(
+            f"{root.name} was prepared from a different corpus than {store.root.name} "
+            f"(source_file vocabularies differ), so its cohort/pid codes are not "
+            f"comparable and this would silently match the wrong patients.")
+
+    keys = set(zip(theirs["cohort"], theirs["pid"]))
+    hit_subjects = mine.loc[[k in keys for k in zip(mine["cohort"], mine["pid"])],
+                            "subject"].to_numpy()
+    return np.isin(store.anchors["subject"].to_numpy(), hit_subjects)
+
+
+def apply_live_policy(store: SequenceStore, split: Dict[str, np.ndarray],
+                      policy: str, other_store_root: os.PathLike
+                      ) -> Tuple[Dict[str, np.ndarray], str]:
+    """Rewrite the split according to how the live-leaderboard patients are treated.
+
+    The live set is drawn entirely from the official *test* portion, but 125 of its
+    279 patients also contribute earlier recordings to training under the
+    benchmark's temporal known-patient split. The three policies differ only in
+    what happens to those patients' anchors:
+
+    ``none``     the benchmark split, untouched. The default, and the only
+                 setting whose test score is comparable with every other run.
+    ``exclude``  drop the patients from train and val entirely, so the model has
+                 never met anyone it will be scored on. Test is left alone.
+    ``include``  move the patients' *test-side* anchors into train as well, so the
+                 model trains on the leaderboard data itself. This deliberately
+                 contaminates the internal test split for those patients -- the
+                 resulting ``predictions_test`` numbers are no longer an honest
+                 estimate of anything, and only the submission is meaningful.
+
+    Returns the new split and a one-line description for the run log.
+    """
+    if policy in (None, "", "none"):
+        return split, "live_policy=none (benchmark split untouched)"
+    if policy not in ("exclude", "include"):
+        raise SplitError(f"unknown live_policy {policy!r}; expected none, exclude or include")
+
+    hit = competition_subject_mask(store, other_store_root)
+    out = dict(split)
+    before = int(out["train"].sum())
+
+    if policy == "exclude":
+        for part in ("train", "val"):
+            if part in out:
+                out[part] = out[part] & ~hit
+        note = (f"live_policy=exclude: dropped {before - int(out['train'].sum()):,} train "
+                f"anchors of live-leaderboard patients "
+                f"({before:,} -> {int(out['train'].sum()):,}); val and test untouched")
+    else:
+        # Everything of theirs that is not already training data -- in practice the
+        # test-side anchors, since the train-side ones are in the mask already.
+        added = hit & ~out["train"] & ~out["val"]
+        out["train"] = out["train"] | added
+        note = (f"live_policy=include: added {int(added.sum()):,} anchors of "
+                f"live-leaderboard patients to train ({before:,} -> "
+                f"{int(out['train'].sum()):,}). The internal test split now overlaps "
+                f"training for these patients -- test metrics are NOT an honest estimate")
+    return out, note
 
 
 # --------------------------------------------------------------- eval strata

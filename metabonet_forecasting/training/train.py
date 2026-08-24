@@ -55,6 +55,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="write predictions but skip scoring")
     ap.add_argument("--predict-val", action="store_true",
                     help="also write predictions for the validation split")
+    live = ap.add_mutually_exclusive_group()
+    live.add_argument("--exclude-live", dest="live_policy", action="store_const",
+                      const="exclude",
+                      help="remove every live-leaderboard patient from train and val. "
+                           "The live set is drawn from the official test portion, but 125 "
+                           "of its 279 patients also contribute earlier recordings to "
+                           "training under the benchmark's temporal known-patient split; "
+                           "this drops those recordings so the live score is a clean "
+                           "novel-patient measurement. Test is left untouched.")
+    live.add_argument("--include-live", dest="live_policy", action="store_const",
+                      const="include",
+                      help="the opposite: also move those patients' test-side anchors "
+                           "INTO train, so the model trains on the leaderboard data "
+                           "itself. This contaminates the internal test split for those "
+                           "patients, so predictions_test stops being an honest estimate "
+                           "-- only the submission means anything. Maximises the live "
+                           "leaderboard, tells you nothing about the annual holdout.")
+    ap.set_defaults(live_policy=None)
     ap.add_argument("--gpu", default=None,
                     help="physical GPU index to train on, e.g. --gpu 6. Masks every other "
                          "device via CUDA_VISIBLE_DEVICES before torch initialises CUDA, so "
@@ -70,6 +88,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(a.gpu)
 
     cfg = load_config(a.config, a.sets)
+    if a.live_policy:
+        cfg.set_path("data.split.live_policy", a.live_policy)
     seed = int(cfg.get("seed", 0))
     seed_everything(seed, deterministic=bool(cfg.get_path("training.deterministic", False)))
 
