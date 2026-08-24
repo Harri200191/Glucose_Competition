@@ -46,6 +46,22 @@ from .metrics import dts_zones, mae, rmse
 HORIZONS = (30, 60, 90, 120)
 
 
+
+def md_table(df: pd.DataFrame) -> str:
+    """Markdown table without pandas' to_markdown, which needs a newer tabulate
+    than this environment ships."""
+    if df is None or not len(df):
+        return "_none_"
+    cols = [str(c) for c in df.columns]
+    rows = [[("" if pd.isna(v) else str(v)) for v in r] for r in df.itertuples(index=False)]
+    width = [max(len(cols[i]), *(len(r[i]) for r in rows)) for i in range(len(cols))]
+    line = lambda cells: "| " + " | ".join(
+        c.ljust(width[i]) for i, c in enumerate(cells)) + " |"
+    out = [line(cols), "|" + "|".join("-" * (w + 2) for w in width) + "|"]
+    out += [line(r) for r in rows]
+    return "\n".join(out)
+
+
 def load_aligned(runs: Sequence[Path], split: str) -> Dict[str, pd.DataFrame]:
     """Every run's predictions, restricted to the anchors they all share."""
     frames = {}
@@ -187,12 +203,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fh.write(f"{len(frames)} runs, {n_anchor:,} shared anchors, "
                  f"{n_subj} patients. Reference: `{ref}`. "
                  f"Equivalence margin +/-{a.margin} DTS zone-A points.\n\n")
-        fh.write("## Leaderboard\n\n" + board.to_markdown(index=False) + "\n\n")
+        fh.write("## Leaderboard\n\n" + md_table(board) + "\n\n")
         fh.write("## Paired differences\n\n")
         fh.write("Positive `delta_A` means the run beats the reference on the "
                  "same patients. `verdict` is about *practical* size, "
                  "`direction` about sign.\n\n")
-        fh.write((pair.to_markdown(index=False) if len(pair) else "_none_") + "\n")
+        fh.write(md_table(pair) + "\n")
     print(f"\nwrote {out}/REPORT.md, leaderboard.csv, paired.csv")
     return 0
 
