@@ -182,6 +182,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "label the run _futins like the trained ones.")
     ap.add_argument("--limit", type=int, default=None,
                     help="hard cap on the number of test anchors")
+    ap.add_argument("--split", default="test",
+                    help="which split to forecast: test | internal_holdout | val. "
+                         "Needed so the foundation-model comparator is scored on "
+                         "exactly the same anchors as the trained models.")
     ap.add_argument("--no-eval", action="store_true")
     a = ap.parse_args(argv)
 
@@ -201,10 +205,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_dir = Path(a.runs_dir or REPO_ROOT / "runs") / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     log = RunLogger(run_dir)
-    log.info(f"zero-shot {a.model} -> {run_dir}")
+    log.info(f"zero-shot {a.model} [{a.split}] -> {run_dir}")
 
     bundle = build_data(cfg)
-    ds = bundle.datasets["test"]
+    if a.split not in bundle.datasets:
+        raise SystemExit(
+            f"split {a.split!r} is not in this bundle ({sorted(bundle.datasets)}); "
+            f"for internal_holdout set data.internal_holdout.enabled=true")
+    ds = bundle.datasets[a.split]
     store = bundle.store
     context = int(cfg.get_path("data.context", 288))
     horizons = [int(h) for h in cfg.get_path("data.horizons_min", [30, 60, 90, 120])]
@@ -278,22 +286,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         truth = targets[:, j]
         df[f"y_true_{h}"] = truth
         df[f"y_pred_{h}"] = np.where(np.isfinite(truth), preds[:, j], np.nan)
-    df.to_parquet(run_dir / "predictions_test.parquet", index=False)
+    df.to_parquet(run_dir / f"predictions_{a.split}.parquet", index=False)
     log.info(f"wrote {len(df):,} predictions in {time.time() - t0:.0f}s")
 
     save_config(cfg, run_dir / "config.resolved.yaml")
     log.write_json("manifest.json", {
         "run_name": run_name, "zero_shot": True, "backend": backend.name,
         "stride": a.stride, "limit": a.limit, "context": context,
+        "split": a.split,
         "config": cfg.to_dict(), "provenance": provenance(),
     })
 
     if not a.no_eval:
         from ..evaluation.evaluate import score_run
-        metrics = score_run(run_dir, bundle=bundle)
+        metrics = score_run(run_dir, bundle=bundle, split=a.split)
         for h in metrics["horizons_min"]:
             o = metrics["strata"]["all"][str(h)]["overall"]
-            log.info(f"test h={h:>3}min  RMSE {o['rmse']:6.2f} mg/dL  "
+            log.info(f"{a.split} h={h:>3}min  RMSE {o['rmse']:6.2f} mg/dL  "
                      f"MAE {o['mae']:6.2f}  MARD {o['mard']:5.2f}%  "
                      f"DTS-A {o['dts_A']:5.1f}%  n={o['n']:,}")
     log.close()

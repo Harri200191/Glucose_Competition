@@ -45,6 +45,7 @@ _nvidia_indices() {
   nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null \
     | tr -d ' ' | paste -sd, - || true
 }
+GPUS_EXPLICIT="${GPUS:-}"
 GPUS="${GPUS:-${CUDA_VISIBLE_DEVICES:-$(_nvidia_indices)}}"
 # How many of OUR runs share one GPU. Raise only if the models are small.
 JOBS_PER_GPU="${JOBS_PER_GPU:-1}"
@@ -58,6 +59,47 @@ GPU_FREE_MB="${GPU_FREE_MB:-12000}"
 # back after handing it a job so its allocation shows up in nvidia-smi first.
 GPU_POLL_S="${GPU_POLL_S:-30}"
 GPU_WARMUP_S="${GPU_WARMUP_S:-90}"
+
+# gpu_autoconfig [need_mb] -- pick the cards that can actually take a job now.
+#
+# The queue below already refuses a device under GPU_FREE_MB and waits, so this
+# is not about correctness; it is about not queueing eight jobs behind a box
+# where someone else is using six of the cards, and about saying so out loud
+# instead of appearing to hang. It narrows GPUS to the devices with room right
+# now and leaves the queue to do admission control on those.
+#
+# An explicit GPUS= or CUDA_VISIBLE_DEVICES in the environment always wins: this
+# only fills in the default.
+gpu_autoconfig() {
+  local need="${1:-$GPU_FREE_MB}"
+  if [[ -n "${GPUS_EXPLICIT:-}" || -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    log "GPUs: using the ones you asked for [$GPUS] (need >= ${need} MiB)"
+    GPU_FREE_MB="$need"; return 0
+  fi
+  command -v nvidia-smi >/dev/null 2>&1 || { warn "no nvidia-smi; CPU only"; return 0; }
+
+  local fit=() tight=() idx used total free best=0
+  while IFS=, read -r idx used total; do
+    idx="${idx// /}"; used="${used// /}"; total="${total// /}"
+    [[ -n "$idx" && -n "$total" ]] || continue
+    free=$(( total - used ))
+    (( free > best )) && best=$free
+    if (( free >= need )); then fit+=("$idx"); else tight+=("${idx}:${free}MiB"); fi
+  done < <(nvidia-smi --query-gpu=index,memory.used,memory.total              --format=csv,noheader,nounits 2>/dev/null || true)
+
+  if (( ${#fit[@]} > 0 )); then
+    GPUS="$(IFS=,; echo "${fit[*]}")"
+    log "GPUs: ${#fit[@]} card(s) with >= ${need} MiB free -> [$GPUS]"
+    (( ${#tight[@]} > 0 )) && log "      skipping busy: ${tight[*]}"
+  else
+    # Nothing fits. Keep every card and let the queue block: cards free up, and
+    # exiting here would throw away an overnight run for a transient state.
+    warn "no GPU currently has ${need} MiB free (best is ${best} MiB)."
+    warn "keeping every card and waiting -- the queue admits jobs as they drain."
+    warn "busy now: ${tight[*]:-none}"
+  fi
+  GPU_FREE_MB="$need"
+}
 # Give up after this many seconds of waiting. 0 = wait forever (the default:
 # a sweep that queues behind other users is doing the right thing).
 GPU_WAIT_MAX_S="${GPU_WAIT_MAX_S:-0}"
