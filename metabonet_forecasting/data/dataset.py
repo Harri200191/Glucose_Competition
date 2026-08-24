@@ -112,9 +112,19 @@ def build_data(cfg: Config, standardizer: Optional[Standardizer] = None) -> Data
         policy = "exclude"
     live_store = sp.pop("live_store",
                         str(REPO_ROOT / "artifacts" / "store" / "submission_live"))
+    holdout_cfg = dict(d.get("internal_holdout", {}) or {})
+    holdout_on = bool(holdout_cfg.pop("enabled", False))
+    holdout_cfg.setdefault("reference_store",
+                           str(REPO_ROOT / S.DEFAULT_ANNUAL_STORE))
+
     split = S.make_split(store, scheme, **sp)
     split, note = S.apply_live_policy(store, split, policy, live_store)
     LOG.info(note)
+    if holdout_on:
+        # Before the standardizer is fitted and before any dataset is built, so
+        # the holdout patients cannot leak into normalisation statistics either.
+        split, hnote = S.apply_internal_holdout(store, split, **holdout_cfg)
+        LOG.info(hnote)
     strata = S.test_strata(store, split)
 
     sampling = dict(d.get("sampling", {}))
@@ -127,6 +137,10 @@ def build_data(cfg: Config, standardizer: Optional[Standardizer] = None) -> Data
     test = S.subsample_mask(split["test"], sampling.get("max_test_windows"), seed + 2,
                             subjects)
     masks = {"train": train, "val": val, "test": test}
+    if "internal_holdout" in split:
+        masks["internal_holdout"] = S.subsample_mask(
+            split["internal_holdout"], sampling.get("max_holdout_windows"),
+            seed + 3, subjects)
 
     if standardizer is None:
         standardizer = fit_standardizer(

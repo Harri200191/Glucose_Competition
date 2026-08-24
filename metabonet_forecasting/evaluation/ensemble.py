@@ -63,7 +63,9 @@ def main(argv=None) -> int:
                     help="where to write the ensemble run (default: parent of "
                          "the first member)")
     ap.add_argument("--weights", nargs="+", type=float, default=None)
-    ap.add_argument("--split", default="test", choices=["test", "val"])
+    ap.add_argument("--split", default="test",
+                    help="test | val | internal_holdout | any split whose "
+                         "predictions_<split>.parquet the members carry")
     ap.add_argument("--no-eval", action="store_true")
     a = ap.parse_args(argv)
     if a.weights and len(a.weights) != len(a.runs):
@@ -82,9 +84,9 @@ def main(argv=None) -> int:
          "n_rows": int(len(out)), "split": a.split}, indent=1))
     print(f"wrote {out_dir} ({len(out):,} rows, {len(frames)} members)")
 
-    if not a.no_eval and a.split == "test":
+    if not a.no_eval:
         from .evaluate import score_run
-        metrics = score_run(out_dir)
+        metrics = score_run(out_dir, split=a.split)
         for h in metrics["horizons_min"]:
             o = metrics["strata"]["all"][str(h)]["overall"]
             print(f"h={h:>3}  RMSE {o['rmse']:6.2f}  MAE {o['mae']:6.2f}  "

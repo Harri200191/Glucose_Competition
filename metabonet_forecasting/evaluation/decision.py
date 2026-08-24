@@ -147,10 +147,11 @@ def quantile_columns(df: pd.DataFrame, horizon: int) -> Tuple[List[str], List[fl
 
 
 def apply_to_run(run_dir: Path, lam: float, val_run: Optional[Path],
-                 grid: Tuple[float, float, float], suffix: str = "_dts") -> Path:
+                 grid: Tuple[float, float, float], suffix: str = "_dts",
+                 split: str = "test") -> Path:
     out_dir = run_dir.parent / (run_dir.name + suffix)
     out_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.read_parquet(run_dir / "predictions_test.parquet")
+    df = pd.read_parquet(run_dir / f"predictions_{split}.parquet")
 
     levels_used: Dict[int, int] = {}
     for h in HORIZONS:
@@ -176,7 +177,7 @@ def apply_to_run(run_dir: Path, lam: float, val_run: Optional[Path],
         df[f"y_pred_{h}"] = new
         levels_used[h] = len(levels)
 
-    df.to_parquet(out_dir / "predictions_test.parquet", index=False)
+    df.to_parquet(out_dir / f"predictions_{split}.parquet", index=False)
     for aux in ("config.resolved.yaml", "manifest.json"):
         src = run_dir / aux
         if src.exists() and not (out_dir / aux).exists():
@@ -198,14 +199,17 @@ def main(argv=None) -> int:
     ap.add_argument("--grid", nargs=3, type=float, default=[40.0, 420.0, 2.0],
                     metavar=("LO", "HI", "STEP"))
     ap.add_argument("--suffix", default="_dts")
+    ap.add_argument("--split", default="test",
+                    help="which predictions_<split>.parquet to re-decide")
     ap.add_argument("--no-eval", action="store_true")
     a = ap.parse_args(argv)
 
-    out_dir = apply_to_run(a.run, a.lam, a.val_run, tuple(a.grid), a.suffix)
+    out_dir = apply_to_run(a.run, a.lam, a.val_run, tuple(a.grid), a.suffix,
+                           split=a.split)
     print(f"wrote {out_dir}")
     if not a.no_eval:
         from .evaluate import score_run
-        metrics = score_run(out_dir)
+        metrics = score_run(out_dir, split=a.split)
         for h in metrics["horizons_min"]:
             o = metrics["strata"]["all"][str(h)]["overall"]
             print(f"h={h:>3}  RMSE {o['rmse']:6.2f}  DTS-A {o['dts_A']:5.2f}%  "

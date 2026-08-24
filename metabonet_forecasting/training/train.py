@@ -43,6 +43,25 @@ def default_run_name(cfg) -> str:
     return f"{model}_{fusion}_ctx{ctx}_{mods}_s{seed}"
 
 
+def _log_scores(log, metrics: dict, label: str) -> None:
+    """Per-horizon line plus the mean DTS zone A across horizons.
+
+    The mean is the number the competition is actually decided on, and reading it
+    off four separate lines by eye is how a regression gets missed.
+    """
+    zone_a = []
+    for horizon in metrics["horizons_min"]:
+        o = metrics["strata"]["all"][str(horizon)]["overall"]
+        log.info(f"{label} h={horizon:>3}min  RMSE {o['rmse']:6.2f} mg/dL  "
+                 f"MAE {o['mae']:6.2f}  MARD {o['mard']:5.2f}%  "
+                 f"DTS-A {o['dts_A']:5.1f}%  n={o['n']:,}")
+        if o.get("dts_A") is not None and np.isfinite(o["dts_A"]):
+            zone_a.append(float(o["dts_A"]))
+    if zone_a:
+        log.info(f"{label} MEAN DTS-A over {len(zone_a)} horizons: "
+                 f"{float(np.mean(zone_a)):5.2f}%")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -73,6 +92,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                            "-- only the submission means anything. Maximises the live "
                            "leaderboard, tells you nothing about the annual holdout.")
     ap.set_defaults(live_policy=None)
+    hold = ap.add_mutually_exclusive_group()
+    hold.add_argument("--no-internal-holdout", dest="internal_holdout",
+                      action="store_const", const=False,
+                      help="skip the second evaluation and keep the ~89 internal-holdout "
+                           "patients in training. Use only to reproduce a pre-holdout "
+                           "number; the holdout score is the honest annual estimate.")
+    hold.add_argument("--internal-holdout", dest="internal_holdout",
+                      action="store_const", const=True,
+                      help="force the internal holdout on (it is on by default).")
+    ap.add_argument("--refresh-internal-holdout", action="store_true",
+                    help="re-draw the internal holdout and overwrite "
+                         "data/internal_holdout.parquet. Every run before and after "
+                         "this is scored on a different patient set, so do it "
+                         "deliberately or not at all.")
+    ap.set_defaults(internal_holdout=None)
     ap.add_argument("--init-from", default=None,
                     help="path to a best.pt checkpoint to warm-start the model weights "
                          "from. The config must build an identical architecture; the "
@@ -94,6 +128,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cfg = load_config(a.config, a.sets)
     if a.live_policy:
         cfg.set_path("data.split.live_policy", a.live_policy)
+    if a.internal_holdout is not None:
+        cfg.set_path("data.internal_holdout.enabled", a.internal_holdout)
+    if a.refresh_internal_holdout:
+        cfg.set_path("data.internal_holdout.refresh", True)
     seed = int(cfg.get("seed", 0))
     seed_everything(seed, deterministic=bool(cfg.get_path("training.deterministic", False)))
 
@@ -148,14 +186,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         val_preds = trainer.predict(bundle.loader("val", cfg, shuffle=False))
         val_preds.to_parquet(run_dir / "predictions_val.parquet", index=False)
 
+    # Second evaluation: the internal holdout that mimics the annual competition
+    # set. These patients were removed from train and val before the standardizer
+    # was even fitted, so this is a novel-patient number by construction.
+    holdout_preds = None
+    if "internal_holdout" in bundle.datasets:
+        holdout_preds = trainer.predict(
+            bundle.loader("internal_holdout", cfg, shuffle=False))
+        holdout_preds.to_parquet(run_dir / "predictions_internal_holdout.parquet",
+                                 index=False)
+        log.info(f"wrote {len(holdout_preds):,} internal-holdout predictions "
+                 f"over {holdout_preds['subject'].nunique()} patients")
+
     if not a.no_eval:
         from ..evaluation.evaluate import score_run
-        metrics = score_run(run_dir, bundle=bundle)
-        for horizon in metrics["horizons_min"]:
-            o = metrics["strata"]["all"][str(horizon)]["overall"]
-            log.info(f"test h={horizon:>3}min  RMSE {o['rmse']:6.2f} mg/dL  "
-                     f"MAE {o['mae']:6.2f}  MARD {o['mard']:5.2f}%  "
-                     f"DTS-A {o['dts_A']:5.1f}%  n={o['n']:,}")
+        _log_scores(log, score_run(run_dir, bundle=bundle), "test")
+        if holdout_preds is not None:
+            _log_scores(log, score_run(run_dir, bundle=bundle,
+                                       split="internal_holdout"), "holdout")
 
     log.info(f"done in {time.time() - t0:.0f}s")
     log.close()

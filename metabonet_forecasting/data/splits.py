@@ -17,6 +17,7 @@ of the data.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -24,6 +25,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from ..common.config import REPO_ROOT
 from . import constants as K
 from .store import SequenceStore
 
@@ -204,6 +206,313 @@ def apply_live_policy(store: SequenceStore, split: Dict[str, np.ndarray],
     return out, note
 
 
+# ------------------------------------------------------ annual-holdout mimic
+# The annual competition holdout is one homogeneous slice of the corpus, not a
+# random sample of it. Profiled from the public release of its feature columns
+# (``data/annual_competition_secret_holdout_set_public.parquet``, 90 patients,
+# 2.62 M rows):
+#
+#     cgm_device                  Dexcom G6               100% of patients
+#     insulin_delivery_modality   AID                     100%
+#     insulin_delivery_algorithm  iLet Bionic Pancreas    100%
+#     insulin_delivery_device     Beta Bionics Gen 4 iLet 100%
+#     carbohydrate log            absent                  0% of rows
+#     activity (heart rate, steps) absent                 0% of rows
+#     age                         median 17, 52% under 18, range 6-71
+#     age_of_diagnosis            withheld (all null)
+#
+# Exactly one source dataset in the public corpus carries that
+# device/algorithm pair: IOBP2, the iLet Bionic Pancreas trial -- 332 patients,
+# Dexcom G6, AID, and likewise no carbohydrate and no activity logging. 332 + 90
+# is close to that trial's full enrolment, so the annual set is best read as the
+# IOBP2 patients withheld from the public release.
+#
+# The mimic therefore holds out whole IOBP2 patients, sampled to match the annual
+# age distribution band for band. Two mismatches are structural and are not
+# papered over:
+#
+#   * sex cannot be matched. IOBP2 ships no gender at all, while the annual set
+#     is 57 male / 32 female. Nothing in the corpus can fix that.
+#   * the annual template asks for ~25 anchors per patient; the mimic scores
+#     every anchor those patients have, which is ~2,500 each. That is a
+#     deliberate difference -- more anchors is a tighter estimate of the same
+#     quantity, not a different quantity -- and ``max_anchors_per_subject``
+#     narrows it for anyone who wants the shapes to match exactly.
+ANNUAL_MIMIC_SOURCE = "IOBP2"
+ANNUAL_MIMIC_N_SUBJECTS = 89
+# 200 rather than inf as the top edge: these end up in a JSON sidecar, and
+# Infinity is not valid JSON.
+ANNUAL_AGE_EDGES: Tuple[float, ...] = (0.0, 10.0, 14.0, 18.0, 26.0, 40.0, 60.0, 200.0)
+# Patients per band in the annual holdout's 89 windowed subjects. Used only when
+# the prepared annual store is absent; when it is present the shares are read
+# from it so this never drifts out of date.
+ANNUAL_AGE_COUNTS: Tuple[int, ...] = (10, 17, 19, 6, 15, 12, 10)
+DEFAULT_ANNUAL_STORE = "artifacts/store/submission_annual"
+
+
+def _age_bands(ages: np.ndarray, edges: Sequence[float]) -> np.ndarray:
+    """Band index per age; ``-1`` for a missing age."""
+    band = np.searchsorted(np.asarray(edges[1:], dtype=float), ages, side="right")
+    return np.where(np.isfinite(ages), band, -1)
+
+
+def _reference_age_counts(reference_store: Optional[os.PathLike],
+                          edges: Sequence[float]) -> Tuple[np.ndarray, str]:
+    """Patients per age band in the real annual holdout.
+
+    Read from the prepared annual store when it exists, so the target
+    distribution tracks the actual holdout; otherwise the frozen profile above.
+    """
+    n_bands = len(edges) - 1
+    if reference_store is not None:
+        root = Path(reference_store)
+        table = root / "subjects.parquet"
+        if table.exists():
+            ages = pd.read_parquet(table)["age"].to_numpy(dtype=float)
+            bands = _age_bands(ages, edges)
+            counts = np.array([(bands == b).sum() for b in range(n_bands)], dtype=float)
+            if counts.sum() > 0:
+                return counts, f"age profile from {root}"
+    counts = np.asarray(ANNUAL_AGE_COUNTS, dtype=float)
+    if counts.size != n_bands:
+        raise SplitError(
+            f"frozen annual age profile has {counts.size} bands but {n_bands} edges "
+            f"were given; pass a reference store or matching age_edges")
+    return counts, "frozen annual age profile (annual store not built)"
+
+
+def annual_mimic_subjects(store: SequenceStore,
+                          n_subjects: int = ANNUAL_MIMIC_N_SUBJECTS,
+                          source: str = ANNUAL_MIMIC_SOURCE,
+                          age_edges: Sequence[float] = ANNUAL_AGE_EDGES,
+                          reference_store: Optional[os.PathLike] = None,
+                          eligible: Optional[np.ndarray] = None,
+                          seed: int = 0) -> Tuple[np.ndarray, str]:
+    """Pick the internal-holdout patients: ``source`` patients whose age
+    distribution matches the annual holdout's, band by band.
+
+    ``eligible`` is a boolean mask over the store's subject table restricting who
+    may be chosen -- used to keep the official test subjects out, so the official
+    test split is left byte-identical and every historical number stays
+    comparable.
+
+    Returns the chosen subject ids and a one-line description.
+    """
+    subjects = store.subjects
+    try:
+        code = store.cohort_code(source)
+    except KeyError as exc:
+        raise SplitError(
+            f"internal holdout wants source {source!r}, which this store does not "
+            f"have: {store.cohort_names()}") from exc
+
+    pool = (subjects["cohort"].to_numpy() == code)
+    if eligible is not None:
+        pool = pool & eligible
+    if not pool.any():
+        raise SplitError(f"no eligible {source} patients to draw an internal holdout from")
+
+    target, ref_note = _reference_age_counts(reference_store, age_edges)
+    target = target / target.sum() * float(n_subjects)
+
+    ages = subjects["age"].to_numpy(dtype=float)
+    bands = _age_bands(ages, age_edges)
+    sid = subjects["subject"].to_numpy()
+    rng = np.random.default_rng(seed)
+
+    # Largest-remainder allocation, then draw within each band. A band the pool
+    # cannot fill gives back its shortfall, which is redistributed over the bands
+    # that still have patients left -- so the count is always exactly n_subjects
+    # when the pool is big enough, and the shortfall is reported when it is not.
+    want = np.floor(target).astype(int)
+    for b in np.argsort(-(target - want))[: int(round(target.sum())) - int(want.sum())]:
+        want[b] += 1
+
+    chosen: List[np.ndarray] = []
+    available = {b: sid[pool & (bands == b)] for b in range(len(age_edges) - 1)}
+    short = 0
+    for b, k in enumerate(want):
+        have = available[b]
+        take = min(int(k), have.size)
+        short += int(k) - take
+        if take:
+            chosen.append(rng.choice(have, size=take, replace=False))
+            available[b] = np.setdiff1d(have, chosen[-1])
+    if short:
+        rest = np.concatenate([v for v in available.values() if v.size]) \
+            if any(v.size for v in available.values()) else np.zeros(0, dtype=sid.dtype)
+        if rest.size:
+            extra = rng.choice(rest, size=min(short, rest.size), replace=False)
+            chosen.append(extra)
+            short -= extra.size
+
+    picked = np.sort(np.concatenate(chosen)) if chosen else np.zeros(0, dtype=sid.dtype)
+    note = (f"internal holdout: {picked.size} {source} patients "
+            f"(pool {int(pool.sum())}, {ref_note})")
+    if short:
+        note += f"; {short} short of the requested {n_subjects}"
+    return picked, note
+
+
+DEFAULT_HOLDOUT_PATH = "data/internal_holdout.parquet"
+
+
+def _holdout_table(store: SequenceStore, mask: np.ndarray) -> pd.DataFrame:
+    """Anchor-level dump of the holdout: what it is, in one file.
+
+    Keyed on ``(source_file, pid)`` rather than ``subject``: ``subject`` is a row
+    index into whichever store minted it and means nothing anywhere else, while
+    the source name and patient id survive a rebuild.
+    """
+    a = store.anchors
+    idx = np.flatnonzero(mask)
+    names = store.cohort_names()
+    subs = store.subjects.set_index("subject")
+    sid = a["subject"].to_numpy()[idx]
+    return pd.DataFrame({
+        "anchor": idx.astype(np.int64),
+        "subject": sid.astype(np.int32),
+        "pid": subs["pid"].reindex(sid).to_numpy(),
+        "source_file": [names[int(c)] for c in subs["cohort"].reindex(sid).to_numpy()],
+        "age": subs["age"].reindex(sid).to_numpy(),
+        "is_test": a["is_test"].to_numpy()[idx].astype(bool),
+    })
+
+
+def _holdout_mask_from_table(store: SequenceStore, table: pd.DataFrame,
+                             n_anchors: Optional[int]) -> Tuple[np.ndarray, str]:
+    """Rebuild the holdout mask for ``store`` from a saved table."""
+    a = store.anchors
+    if n_anchors == len(a):
+        mask = np.zeros(len(a), dtype=bool)
+        mask[table["anchor"].to_numpy()] = True
+        return mask, "by anchor id"
+    # Different store: fall back to patient identity and take all their anchors.
+    names = store.cohort_names()
+    subs = store.subjects
+    keys = set(zip(table["source_file"].astype(str), table["pid"].astype(int)))
+    mine = [(names[int(c)], int(p)) for c, p in zip(subs["cohort"], subs["pid"])]
+    picked = subs["subject"].to_numpy()[np.array([k in keys for k in mine], dtype=bool)]
+    if picked.size == 0:
+        raise SplitError(
+            f"saved internal holdout names no patient present in {store.root}; "
+            f"the stores were built from different corpora")
+    return np.isin(a["subject"].to_numpy(), picked), "by patient identity (store differs)"
+
+
+def apply_internal_holdout(store: SequenceStore, split: Dict[str, np.ndarray],
+                           n_subjects: int = ANNUAL_MIMIC_N_SUBJECTS,
+                           source: str = ANNUAL_MIMIC_SOURCE,
+                           age_edges: Sequence[float] = ANNUAL_AGE_EDGES,
+                           reference_store: Optional[os.PathLike] = None,
+                           allow_test_subjects: bool = False,
+                           max_anchors_per_subject: Optional[int] = None,
+                           path: Optional[os.PathLike] = None,
+                           refresh: bool = False,
+                           seed: int = 0,
+                           ) -> Tuple[Dict[str, np.ndarray], str]:
+    """Add an ``internal_holdout`` part that mimics the annual competition set.
+
+    The chosen patients are removed from **train and val entirely** -- every
+    anchor of theirs, on both sides of the official temporal boundary. The model
+    therefore never sees a single window from a holdout patient, which is the
+    whole point: the internal holdout has to answer "how would this do on 89
+    iLet patients it has never met", and it can only answer that if it has never
+    met them. :func:`assert_holdout_unseen` enforces it before this returns, and
+    again inside :func:`assert_no_subject_overlap`.
+
+    The selection is written once to ``path`` (default
+    ``data/internal_holdout.parquet``) and every later run reuses that file, so
+    all runs are compared on an identical patient set even if the code, the seed
+    or the config drifts. ``refresh=True`` re-draws and overwrites it.
+
+    By default the holdout is drawn only from patients with no anchors in the
+    official test split, so ``predictions_test`` is unchanged and every number
+    already in ``results/all_runs.csv`` stays comparable. Set
+    ``allow_test_subjects`` to relax that.
+    """
+    a = store.anchors
+    subjects = a["subject"].to_numpy()
+    dest = Path(path) if path is not None else Path(DEFAULT_HOLDOUT_PATH)
+    if not dest.is_absolute():
+        dest = REPO_ROOT / dest
+    meta_path = dest.with_suffix(".json")
+
+    if dest.exists() and not refresh:
+        table = pd.read_parquet(dest)
+        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        hold, how = _holdout_mask_from_table(store, table, meta.get("store_n_anchors"))
+        picked = np.unique(subjects[hold])
+        note = (f"internal holdout: reused {dest} -- {picked.size} patients, "
+                f"{int(hold.sum()):,} anchors, resolved {how}")
+    else:
+        eligible = np.ones(len(store.subjects), dtype=bool)
+        if not allow_test_subjects:
+            test_subjects = np.unique(subjects[split["test"]])
+            eligible &= ~np.isin(store.subjects["subject"].to_numpy(), test_subjects)
+
+        picked, note = annual_mimic_subjects(
+            store, n_subjects=n_subjects, source=source, age_edges=age_edges,
+            reference_store=reference_store, eligible=eligible, seed=seed)
+        if picked.size == 0:
+            raise SplitError("internal holdout selected no patients")
+
+        hold = np.isin(subjects, picked)
+        if max_anchors_per_subject:
+            hold = subsample_mask(hold, int(max_anchors_per_subject) * picked.size,
+                                  seed + 7, subjects)
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _holdout_table(store, hold).to_parquet(dest, index=False)
+        ages = store.subjects.set_index("subject")["age"].reindex(picked).to_numpy()
+        meta_path.write_text(json.dumps({
+            "store": str(store.root), "store_n_anchors": int(len(a)),
+            "source": source, "n_subjects": int(picked.size),
+            "n_anchors": int(hold.sum()), "seed": int(seed),
+            "age_edges": [float(e) for e in age_edges],
+            "age_median": float(np.nanmedian(ages)) if ages.size else None,
+            "frac_under_18": float(np.nanmean(ages < 18)) if ages.size else None,
+            "allow_test_subjects": bool(allow_test_subjects),
+            "max_anchors_per_subject": max_anchors_per_subject,
+        }, indent=1))
+        note += f"; wrote {dest}"
+
+    out = dict(split)
+    before = int(out["train"].sum())
+    for part in ("train", "val"):
+        if part in out:
+            out[part] = out[part] & ~np.isin(subjects, picked)
+    out["internal_holdout"] = hold
+
+    note += (f"; {int(hold.sum()):,} holdout anchors over {picked.size} patients; "
+             f"train {before:,} -> {int(out['train'].sum()):,}")
+    assert_holdout_unseen(store, out)
+    return out, note
+
+
+def assert_holdout_unseen(store: SequenceStore, split: Dict[str, np.ndarray]) -> None:
+    """The one invariant that makes the internal holdout worth reading.
+
+    Called from :func:`apply_internal_holdout` and again from
+    :func:`make_split`'s guard, so a hand-edited split cannot smuggle a holdout
+    patient into training without the run dying first.
+    """
+    if "internal_holdout" not in split:
+        return
+    subjects = store.anchors["subject"].to_numpy()
+    held = set(np.unique(subjects[split["internal_holdout"]]).tolist())
+    for part in ("train", "val"):
+        if part not in split:
+            continue
+        seen = set(np.unique(subjects[split[part]]).tolist())
+        overlap = held & seen
+        if overlap:
+            raise SplitError(
+                f"{len(overlap)} internal-holdout patients also appear in {part}: "
+                f"the holdout would be scoring patients the model trained on. "
+                f"Subjects: {sorted(overlap)[:10]}")
+
+
 # --------------------------------------------------------------- eval strata
 def test_strata(store: SequenceStore, split: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Named subsets of the test mask that every run is scored on.
@@ -268,6 +577,7 @@ def assert_no_subject_overlap(store: SequenceStore, split: Dict[str, np.ndarray]
     for name, mask in split.items():
         if not mask.any():
             raise SplitError(f"split part {name!r} is empty")
+    assert_holdout_unseen(store, split)
 
 
 def describe_split(store: SequenceStore, split: Dict[str, np.ndarray]) -> pd.DataFrame:

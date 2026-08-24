@@ -56,18 +56,25 @@ def prediction_strata(df: pd.DataFrame, cohort_names: List[str]) -> Dict[str, np
 
 
 def score_run(run_dir, bundle=None, n_boot: int = 0, seed: int = 0,
-              min_stratum_n: int = 50) -> Dict:
+              min_stratum_n: int = 50, split: str = "test") -> Dict:
+    """Score ``predictions_<split>.parquet``.
+
+    ``split="test"`` keeps the historical filenames (``metrics.json`` /
+    ``metrics.csv``) so every existing reader and the aggregator are unaffected;
+    any other split is written to ``metrics_<split>.json`` / ``.csv`` beside them.
+    """
     run_dir = Path(run_dir)
-    pred_path = run_dir / "predictions_test.parquet"
+    pred_path = run_dir / f"predictions_{split}.parquet"
     if not pred_path.exists():
         raise FileNotFoundError(f"{pred_path} not found; train the run first")
     df = pd.read_parquet(pred_path)
+    suffix = "" if split == "test" else f"_{split}"
 
     horizons = sorted(int(c.split("_")[-1]) for c in df.columns if c.startswith("y_true_"))
     cohort_names = _cohort_names(run_dir, bundle)
 
     strata = prediction_strata(df, cohort_names)
-    out: Dict = {"run": run_dir.name, "horizons_min": horizons,
+    out: Dict = {"run": run_dir.name, "split": split, "horizons_min": horizons,
                  "n_predictions": int(len(df)),
                  "n_subjects": int(df["subject"].nunique()),
                  "strata": {}, "by_source": {}, "bootstrap": {}}
@@ -97,7 +104,7 @@ def score_run(run_dir, bundle=None, n_boot: int = 0, seed: int = 0,
                                  for m in ("rmse", "mae", "mard")}
             out["bootstrap"][stratum] = block
 
-    with open(run_dir / "metrics.json", "w") as fh:
+    with open(run_dir / f"metrics{suffix}.json", "w") as fh:
         json.dump(out, fh, indent=2, default=float)
 
     # A flat one-row-per-(stratum, horizon) CSV so aggregation never has to parse
@@ -108,9 +115,10 @@ def score_run(run_dir, bundle=None, n_boot: int = 0, seed: int = 0,
             continue
         for h, block in per_h.items():
             for name, values in block.items():
-                rows.append(dict(run=run_dir.name, stratum=stratum, horizon=int(h),
-                                 slice=name, **{k: v for k, v in values.items()}))
-    pd.DataFrame(rows).to_csv(run_dir / "metrics.csv", index=False)
+                rows.append(dict(run=run_dir.name, split=split, stratum=stratum,
+                                 horizon=int(h), slice=name,
+                                 **{k: v for k, v in values.items()}))
+    pd.DataFrame(rows).to_csv(run_dir / f"metrics{suffix}.csv", index=False)
     return out
 
 
