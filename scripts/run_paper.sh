@@ -101,26 +101,46 @@ if [[ "$STAGE" == "all" || "$STAGE" == "train" ]]; then
 fi
 
 # ------------------------------------------- 2. Chronos-2, the FM comparator
+# Chronos needs a newer Python than the repo default, so rather than skipping
+# the arm we go and find an interpreter that has it. The package itself imports
+# fine under 3.13 / numpy 2, so only this stage changes interpreter.
+find_fm_py() {
+  local cand
+  for cand in "${FM_PY:-}" "$PY" \
+              "$HOME/anaconda3/envs/ecg_cpc/bin/python" \
+              "$HOME/anaconda3/envs/multi/bin/python" \
+              "$(command -v python3 || true)"; do
+    [[ -n "$cand" && -x "$(command -v "$cand" 2>/dev/null || echo "$cand")" ]] || continue
+    if "$cand" -c "import chronos" >/dev/null 2>&1; then echo "$cand"; return 0; fi
+  done
+  return 1
+}
+
 if [[ "$STAGE" == "all" || "$STAGE" == "train" || "$STAGE" == "fm" ]]; then
-  if $PY -c "import chronos" 2>/dev/null; then
-    gpu_autoconfig "$NEED_MB"
-    FM_GPU="${GPUS%%,*}"
-    for sp in $SPLITS; do
-      log "Chronos-2 zero-shot on $sp (causal: no covariates) on GPU $FM_GPU"
-      $PY -m metabonet_forecasting.fm.zeroshot \
-        --model chronos2 --name "$FM_NAME" --runs-dir "$RUNS_DIR" \
-        --split "$sp" --gpu "$FM_GPU" \
-        --set "data.store=$STORE" "data.internal_holdout.enabled=true" \
-              "data.split.seed=$SEED" \
-        || warn "Chronos-2 failed on $sp"
-    done
-  else
-    warn "the 'chronos' package is not installed, so the foundation-model"
-    warn "comparator is SKIPPED. Everything else still runs. To include it:"
-    warn "    pip install 'chronos-forecasting>=2.0'"
-    warn "then re-run with STAGE=fm. The paper wants this arm -- it answers"
-    warn "'would an off-the-shelf model have done just as well?'"
+  if ! FM_PY_BIN="$(find_fm_py)"; then
+    die "the foundation-model comparator needs the 'chronos' package and no
+interpreter on this box has it. The paper arm is not optional -- it answers
+'would an off-the-shelf model have done just as well?'. Install it with:
+
+    /home/\$USER/anaconda3/envs/ecg_cpc/bin/pip install 'chronos-forecasting>=2.0'
+
+or point FM_PY at an interpreter that already has it, then re-run
+STAGE=fm scripts/run_paper.sh"
   fi
+  log "foundation-model arm interpreter: $FM_PY_BIN"
+  gpu_autoconfig "$NEED_MB"
+  FM_GPU="${GPUS%%,*}"
+  for sp in $SPLITS; do
+    log "Chronos-2 zero-shot on $sp (causal: no covariates) on GPU $FM_GPU"
+    PYTHONPATH="$REPO_ROOT" "$FM_PY_BIN" -m metabonet_forecasting.fm.zeroshot \
+      --model chronos2 --name "$FM_NAME" --runs-dir "$RUNS_DIR" \
+      --split "$sp" --gpu "$FM_GPU" \
+      --set "data.store=$STORE" "data.internal_holdout.enabled=true" \
+            "data.split.seed=$SEED" \
+      || die "Chronos-2 failed on $sp -- see the traceback above. Nothing is
+skipped in this protocol: fix it or drop the FM arm deliberately with
+SPLITS=... and a note in the paper."
+  done
 fi
 
 if [[ "$STAGE" == "train" ]]; then
