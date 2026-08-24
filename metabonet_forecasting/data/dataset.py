@@ -112,6 +112,7 @@ def build_data(cfg: Config, standardizer: Optional[Standardizer] = None) -> Data
         policy = "exclude"
     live_store = sp.pop("live_store",
                         str(REPO_ROOT / "artifacts" / "store" / "submission_live"))
+    modality = sp.pop("modality", None)
     holdout_cfg = dict(d.get("internal_holdout", {}) or {})
     holdout_on = bool(holdout_cfg.pop("enabled", False))
     holdout_cfg.setdefault("reference_store",
@@ -120,6 +121,9 @@ def build_data(cfg: Config, standardizer: Optional[Standardizer] = None) -> Data
     split = S.make_split(store, scheme, **sp)
     split, note = S.apply_live_policy(store, split, policy, live_store)
     LOG.info(note)
+    if modality:
+        split, mnote = S.restrict_to_modality(store, split, modality)
+        LOG.info(mnote)
     if holdout_on:
         # Before the standardizer is fitted and before any dataset is built, so
         # the holdout patients cannot leak into normalisation statistics either.

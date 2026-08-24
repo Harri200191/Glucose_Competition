@@ -206,6 +206,63 @@ def apply_live_policy(store: SequenceStore, split: Dict[str, np.ndarray],
     return out, note
 
 
+# ------------------------------------------------------- modality restriction
+# Subject codes for patients whose insulin_delivery_modality was never recorded.
+# Guard rather than convenience: ``levels[-1]`` resolves to "MDI" in Python, so
+# a naive label lookup silently files 22 unknown-modality patients under MDI and
+# inflates the manual-injection group by 79%.
+MODALITY_UNKNOWN = -1
+
+
+def modality_mask(store: SequenceStore, which: str) -> np.ndarray:
+    """Anchors whose patient matches ``which``: AID | non-AID | SAP | MDI | all.
+
+    ``non-AID`` means SAP or MDI *with a recorded modality* -- unknown is never
+    silently folded in either direction.
+    """
+    levels = store.manifest.get("levels", {}).get("insulin_delivery_modality", [])
+    code = store.subjects.set_index("subject")["modality"].reindex(
+        store.anchors["subject"].to_numpy()).to_numpy()
+    known = code != MODALITY_UNKNOWN
+    if which in (None, "", "all"):
+        return np.ones(len(code), dtype=bool)
+    if which == "AID":
+        return known & (code == levels.index("AID"))
+    if which == "non-AID":
+        return known & (code != levels.index("AID"))
+    if which in levels:
+        return known & (code == levels.index(which))
+    raise SplitError(
+        f"unknown modality {which!r}; expected all, AID, non-AID or one of {levels}")
+
+
+def restrict_to_modality(store: SequenceStore, split: Dict[str, np.ndarray],
+                         which: str, parts: Sequence[str] = ("train", "val"),
+                         ) -> Tuple[Dict[str, np.ndarray], str]:
+    """Keep only ``which`` patients in ``parts``.
+
+    Used for the future-insulin subgroup robustness check, where a model is
+    trained on one therapy population only. Test is left alone by default so the
+    evaluation set does not move between arms.
+    """
+    if which in (None, "", "all"):
+        return split, "modality=all (no restriction)"
+    keep = modality_mask(store, which)
+    out = dict(split)
+    before = {p: int(out[p].sum()) for p in parts if p in out}
+    for p in parts:
+        if p in out:
+            out[p] = out[p] & keep
+    after = {p: int(out[p].sum()) for p in parts if p in out}
+    for p, n in after.items():
+        if n == 0:
+            raise SplitError(
+                f"modality={which!r} leaves split part {p!r} empty")
+    note = (f"modality={which}: " +
+            ", ".join(f"{p} {before[p]:,} -> {after[p]:,}" for p in after))
+    return out, note
+
+
 # ------------------------------------------------------ annual-holdout mimic
 # The annual competition holdout is one homogeneous slice of the corpus, not a
 # random sample of it. Profiled from the public release of its feature columns
