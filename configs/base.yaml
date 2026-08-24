@@ -40,11 +40,34 @@ data:
     val_frac: 0.12
     seed: 0
 
+  # Second evaluation set. The annual competition holdout is not a random slice
+  # of this corpus: all 90 of its patients are on a Dexcom G6 with the iLet
+  # Bionic Pancreas (AID), with no carbohydrate and no activity logging, median
+  # age 17. Exactly one source dataset here matches that -- IOBP2 -- so the
+  # internal holdout is IOBP2 patients, sampled to the annual age distribution
+  # and held out whole.
+  #
+  # Holdout patients are removed from train AND val before the standardizer is
+  # fitted, so the model never sees a single window of theirs; splits.py raises
+  # if that is ever violated. The selection is frozen in `path` on first use and
+  # reused by every later run, so runs stay comparable. Cost: ~89 of the 1,907
+  # patients leave the training pool.
+  internal_holdout:
+    enabled: true
+    n_subjects: 89
+    source: IOBP2
+    allow_test_subjects: false   # keep the official test split byte-identical
+    max_anchors_per_subject: null  # null = score every anchor these patients have
+    path: data/internal_holdout.parquet
+    refresh: false               # true = re-draw and overwrite the frozen set
+    seed: 0
+
   sampling:
     train_stride: 1            # extra thinning on top of the store's anchor stride
     max_train_windows: 2000000
     max_val_windows: 150000
     max_test_windows: 400000
+    max_holdout_windows: null    # null = the whole internal holdout
     standardizer_sample: 200000
     seed: 0
 

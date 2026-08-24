@@ -4,6 +4,14 @@
 data:
   store: artifacts/store/smoke
   context: 96
+  # The smoke store holds no IOBP2 patients, so the internal holdout borrows the
+  # nearest match it does have (AZT1D: Dexcom G6, AID) purely to exercise the
+  # code path. AZT1D has no under-18s, so the age match falls short and the
+  # shortfall redistribution runs -- which is the branch worth smoke-testing.
+  internal_holdout:
+    source: AZT1D
+    n_subjects: 5
+    path: artifacts/store/smoke/internal_holdout_smoke.parquet
   sampling:
     max_train_windows: 20000
     max_val_windows: 4000
