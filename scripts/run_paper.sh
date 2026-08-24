@@ -122,7 +122,12 @@ if [[ "$STAGE" == "all" || "$STAGE" == "train" || "$STAGE" == "fm" ]]; then
 interpreter on this box has it. The paper arm is not optional -- it answers
 'would an off-the-shelf model have done just as well?'. Install it with:
 
-    /home/\$USER/anaconda3/envs/ecg_cpc/bin/pip install 'chronos-forecasting>=2.0'
+    ENV=\$HOME/anaconda3/envs/ecg_cpc
+    env -u PYTHONPATH \$ENV/bin/python -m pip install 'chronos-forecasting>=2.0' accelerate
+
+('accelerate' is required too: Chronos loads with device_map and fails without
+it. Use 'python -m pip', not the bare 'pip' shim, which can resolve against a
+different environment on this box.)
 
 or point FM_PY at an interpreter that already has it, then re-run
 STAGE=fm scripts/run_paper.sh"
@@ -148,14 +153,22 @@ if [[ "$STAGE" == "train" ]]; then
 fi
 
 # --------------------------------------- 3. collect + VERIFY identical splits
-present=()
+# Nothing is quietly dropped: a frozen protocol with a missing arm is a
+# different study, so a missing model stops the analysis.
+present=(); missing=()
 for spec in "${MODELS[@]}"; do
   IFS=: read -r name _ _ _ <<< "$spec"
   if [[ -d "$RUNS_DIR/$name" ]]; then present+=("$RUNS_DIR/$name")
-  else warn "$name missing -- excluded"; fi
+  else missing+=("$name"); fi
 done
-[[ -d "$RUNS_DIR/$FM_NAME" ]] && present+=("$RUNS_DIR/$FM_NAME")
-[[ ${#present[@]} -ge 2 ]] || die "need at least two runs; check the logs"
+if [[ -d "$RUNS_DIR/$FM_NAME" ]]; then present+=("$RUNS_DIR/$FM_NAME")
+else missing+=("$FM_NAME (foundation-model comparator)"); fi
+if (( ${#missing[@]} > 0 )); then
+  die "these protocol arms have no run directory: ${missing[*]}
+Train them (STAGE=train) or, if you are deliberately dropping an arm, say so by
+editing MODELS in this script -- do not let the comparison quietly proceed
+without it."
+fi
 
 log "verifying every run used the identical split and protocol"
 if ! $PY "$REPO_ROOT/scripts/analysis/_verify_protocol.py" "${present[@]}" \
@@ -168,9 +181,11 @@ fi
 for sp in $SPLITS; do
   log "=== scoring split: $sp ==="
   for r in "${present[@]}"; do
-    [[ -f "$r/predictions_${sp}.parquet" ]] || { warn "$(basename "$r"): no $sp"; continue; }
+    [[ -f "$r/predictions_${sp}.parquet" ]] \
+      || die "$(basename "$r") has no predictions_${sp}.parquet. Every arm must be
+scored on every split, or the comparison is between different things."
     $PY "$REPO_ROOT/scripts/analysis/_score_split.py" "$r" "$sp" >/dev/null \
-      || warn "scoring $(basename "$r") [$sp] failed"
+      || die "scoring $(basename "$r") [$sp] failed"
   done
 
   log "paired comparison on $sp (reference $REFERENCE, margin +/-$MARGIN)"
@@ -182,10 +197,10 @@ for sp in $SPLITS; do
     log "annual-shaped estimate per run (strict competition draws)"
     : > "$OUT/annual_estimates.txt"
     for r in "${present[@]}"; do
-      [[ -f "$r/predictions_${sp}.parquet" ]] || continue
       { echo "### $(basename "$r")"
         $PY -m metabonet_forecasting.evaluation.annual_estimate "$r" \
-          --split "$sp" --strict 2>/dev/null || echo "  (failed)"
+          --split "$sp" --strict 2>/dev/null \
+          || die "annual estimate failed for $(basename "$r")"
         echo; } >> "$OUT/annual_estimates.txt"
     done
     cat "$OUT/annual_estimates.txt"
