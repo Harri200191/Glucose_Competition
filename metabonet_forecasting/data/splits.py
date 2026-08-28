@@ -466,17 +466,24 @@ def apply_internal_holdout(store: SequenceStore, split: Dict[str, np.ndarray],
                            max_anchors_per_subject: Optional[int] = None,
                            path: Optional[os.PathLike] = None,
                            refresh: bool = False,
+                           exclude_whole_source: bool = True,
                            seed: int = 0,
                            ) -> Tuple[Dict[str, np.ndarray], str]:
     """Add an ``internal_holdout`` part that mimics the annual competition set.
 
     The chosen patients are removed from **train and val entirely** -- every
-    anchor of theirs, on both sides of the official temporal boundary. The model
-    therefore never sees a single window from a holdout patient, which is the
-    whole point: the internal holdout has to answer "how would this do on 89
-    iLet patients it has never met", and it can only answer that if it has never
-    met them. :func:`assert_holdout_unseen` enforces it before this returns, and
-    again inside :func:`assert_no_subject_overlap`.
+    anchor of theirs, on both sides of the official temporal boundary.
+    :func:`assert_holdout_unseen` enforces it before this returns, and again
+    inside :func:`assert_no_subject_overlap`.
+
+    ``exclude_whole_source`` (default **True**) goes further and drops *every*
+    patient of ``source`` from train and val, not only the 89 that are scored.
+    Without it the model still trains on the other 243 IOBP2 patients -- same
+    trial, same Dexcom G6, same iLet pump -- and the holdout then answers the
+    easier question "a new patient from a study I know well". With it, the model
+    has never seen the therapy domain at all, and the holdout answers "a patient
+    from a study I have never seen", which is the honest stand-in for a secret
+    external set. It costs ~615,000 further training anchors.
 
     The selection is written once to ``path`` (default
     ``data/internal_holdout.parquet``) and every later run reuses that file, so
@@ -536,15 +543,56 @@ def apply_internal_holdout(store: SequenceStore, split: Dict[str, np.ndarray],
 
     out = dict(split)
     before = int(out["train"].sum())
+    drop = np.isin(subjects, picked)
+    extra = 0
+    if exclude_whole_source:
+        # Every patient of the holdout's source leaves training, not just the
+        # scored ones. The scored set is unchanged; what changes is that the
+        # model has no exposure to the domain.
+        source_anchors = _source_mask(store, source)
+        extra = int((source_anchors & ~drop & out["train"]).sum())
+        drop = drop | source_anchors
     for part in ("train", "val"):
         if part in out:
-            out[part] = out[part] & ~np.isin(subjects, picked)
+            out[part] = out[part] & ~drop
     out["internal_holdout"] = hold
 
     note += (f"; {int(hold.sum()):,} holdout anchors over {picked.size} patients; "
              f"train {before:,} -> {int(out['train'].sum()):,}")
+    if exclude_whole_source:
+        note += (f" (whole-source exclusion dropped {extra:,} further {source} "
+                 f"anchors from train)")
+    else:
+        note += f" (NOTE: other {source} patients remain in training)"
     assert_holdout_unseen(store, out)
+    if exclude_whole_source:
+        assert_source_unseen(store, out, source)
     return out, note
+
+
+def _source_mask(store: SequenceStore, source: str) -> np.ndarray:
+    """Every anchor belonging to ``source``."""
+    return store.anchors["cohort"].to_numpy() == store.cohort_code(source)
+
+
+def assert_source_unseen(store: SequenceStore, split: Dict[str, np.ndarray],
+                         source: str) -> None:
+    """No patient of ``source`` may appear in train or val.
+
+    The stronger sibling of :func:`assert_holdout_unseen`: that one protects the
+    89 scored patients, this one protects the whole domain, so a holdout meant to
+    stand in for an unseen study cannot silently become a within-study one.
+    """
+    src = _source_mask(store, source)
+    for part in ("train", "val"):
+        if part not in split:
+            continue
+        n = int((split[part] & src).sum())
+        if n:
+            raise SplitError(
+                f"{n:,} {source} anchors are still in {part} despite "
+                f"exclude_whole_source=True; the internal holdout would be a "
+                f"within-study evaluation, not a stand-in for an unseen study")
 
 
 def assert_holdout_unseen(store: SequenceStore, split: Dict[str, np.ndarray]) -> None:

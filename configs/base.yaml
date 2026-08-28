@@ -22,7 +22,22 @@ data:
   use_source_identity: false   # cohort id as a static: shortcut risk, off by default
   use_time_features: true
   missing_policy: zero         # zero | ffill | learned
-  target_mode: delta           # predict the change from the last reading
+  # delta | absolute | log_ratio | log
+  #
+  # `delta` (the benchmark default) predicts the change from the last reading;
+  # a zero-initialised head therefore starts at persistence.
+  #
+  # `log_ratio` predicts log(y / cgm_now) and is the COMPETITION-aligned choice.
+  # DTS zone A is exactly 0.8*y <= p <= 1.2*y, i.e. +/-20% RELATIVE error, so in
+  # log space it is a constant-width band on the raw model output: an ordinary
+  # absolute-error loss here IS a relative-error loss in mg/dL. Under `delta` a
+  # 20 mg/dL miss is a zone-B failure at a true 80 and a comfortable zone-A pass
+  # at a true 300, and the loss cannot tell them apart. `log_ratio` also keeps
+  # the persistence initialisation, because a zero output maps to ~cgm_now.
+  #
+  # Numbers from a log-space run are NOT comparable with a delta run's; treat it
+  # as a separate arm, not a tweak.
+  target_mode: delta
 
   # Planned future actions. EMPTY IS THE BENCHMARK -- leave it empty.
   #
@@ -56,6 +71,13 @@ data:
     enabled: true
     n_subjects: 89
     source: IOBP2
+    # true (default): drop EVERY IOBP2 patient from train and val, not only the
+    # 89 that get scored. Without this the model still trains on the other 243
+    # patients of the same trial -- same sensor, same pump, same protocol -- and
+    # the holdout answers the easy question "a new patient from a study I know"
+    # rather than "a patient from a study I have never seen". Costs ~615,000
+    # further training anchors. splits.assert_source_unseen enforces it.
+    exclude_whole_source: true
     allow_test_subjects: false   # keep the official test split byte-identical
     max_anchors_per_subject: null  # null = score every anchor these patients have
     path: data/internal_holdout.parquet
@@ -115,5 +137,11 @@ training:
   deterministic: false
   log_every: 500
   loss:
+    # Per-horizon weights, in the order of data.horizons_min. Honoured by every
+    # loss (huber, mse, mae, quantile, hybrid). The scorer pools all four
+    # horizons, but 30 min already sits near its ceiling (~92% zone A) while
+    # 120 min has several times the headroom (~72%), so an unweighted loss
+    # under-invests in the horizon that decides the result. null = equal.
+    horizon_weights: null      # e.g. [1.0, 1.0, 1.5, 2.0]
     name: huber
     delta: 1.0

@@ -24,6 +24,14 @@ import numpy as np
 
 from . import constants as K
 
+# Target parameterisations that live in log space. Zone A is a +/-20% band, so a
+# log target turns the competition's relative criterion into an ordinary
+# absolute one -- see Standardizer.transform_targets.
+LOG_TARGET_MODES = ("log_ratio", "log")
+# exp() bounds, in log mg/dL. Wide enough never to bind on a sane forecast,
+# tight enough that an untrained model cannot produce inf.
+LOG_EXP_LO, LOG_EXP_HI = float(np.log(1.0)), float(np.log(2000.0))
+
 
 def channel_kind(name: str) -> str:
     """How a channel should be scaled, from its name.
@@ -94,11 +102,40 @@ class Standardizer:
         return np.clip(np.nan_to_num(out, nan=0.0), -8.0, 8.0)
 
     def transform_targets(self, y: np.ndarray, cgm_now: np.ndarray) -> np.ndarray:
-        """mg/dL -> model space. ``delta`` predicts the change from the last reading."""
+        """mg/dL -> model space.
+
+        ``delta``      predict the change from the last reading (the default)
+        ``absolute``   predict the level
+        ``log_ratio``  predict ``log(y / cgm_now)``
+        ``log``        predict ``log(y)``
+
+        The log modes exist because the competition metric is relative, not
+        absolute: DTS zone A is exactly ``0.8*y <= p <= 1.2*y``. Under
+        ``log_ratio`` the model output and the target differ by exactly
+        ``log(p/y)``, so zone A becomes a **constant-width band on the raw model
+        output** and an ordinary absolute-error loss in this space *is* a
+        relative-error loss in mg/dL. Under ``delta`` it is not: a 20 mg/dL miss
+        is scored identically at a true 80 (zone B) and a true 300 (zone A),
+        while the loss sees one number.
+
+        Non-positive or missing glucose becomes NaN here rather than -inf, and
+        the mask drops it exactly as it drops any other absent target.
+        """
         y = np.asarray(y, dtype=np.float32)
-        base = np.asarray(cgm_now, dtype=np.float32).reshape(-1, 1) \
-            if self.target_mode == "delta" else 0.0
-        return (y - base - self.target_center) / np.maximum(self.target_scale, 1e-6)
+        z = self._to_model_space(y, cgm_now)
+        return (z - self.target_center) / np.maximum(self.target_scale, 1e-6)
+
+    def _to_model_space(self, y: np.ndarray, cgm_now: np.ndarray) -> np.ndarray:
+        """mg/dL -> the pre-standardisation target, per ``target_mode``."""
+        now = np.asarray(cgm_now, dtype=np.float32).reshape(-1, 1)
+        if self.target_mode in LOG_TARGET_MODES:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                out = np.log(np.where(y > 0, y, np.nan))
+                if self.target_mode == "log_ratio":
+                    out = out - np.log(np.where(now > 0, now, np.nan))
+            return out.astype(np.float32)
+        base = now if self.target_mode == "delta" else 0.0
+        return y - base
 
     def inverse_targets(self, z, cgm_now):
         """Model space -> mg/dL. Works for numpy arrays and torch tensors alike.
@@ -107,15 +144,28 @@ class Standardizer:
         ``device`` attribute for array-API compliance, so the obvious test picks
         the wrong branch and fails on the dtype.
         """
+        log_mode = self.target_mode in LOG_TARGET_MODES
         if hasattr(z, "detach"):          # torch tensor
             import torch
             center = torch.as_tensor(self.target_center, device=z.device, dtype=z.dtype)
             scale = torch.as_tensor(self.target_scale, device=z.device, dtype=z.dtype)
+            if log_mode:
+                out = z * scale + center
+                if self.target_mode == "log_ratio":
+                    out = out + torch.log(cgm_now.reshape(-1, 1).clamp(min=1.0))
+                # Clamp the exponent, not the result: exp() of an early-training
+                # outlier overflows to inf and poisons the whole batch.
+                return torch.exp(out.clamp(LOG_EXP_LO, LOG_EXP_HI))
             base = cgm_now.reshape(-1, 1) if self.target_mode == "delta" else 0.0
             return z * scale + center + base
         center, scale = self.target_center, self.target_scale
-        base = np.asarray(cgm_now, dtype=np.float32).reshape(-1, 1) \
-            if self.target_mode == "delta" else 0.0
+        now = np.asarray(cgm_now, dtype=np.float32).reshape(-1, 1)
+        if log_mode:
+            out = np.asarray(z, dtype=np.float32) * scale + center
+            if self.target_mode == "log_ratio":
+                out = out + np.log(np.maximum(now, 1.0))
+            return np.exp(np.clip(out, LOG_EXP_LO, LOG_EXP_HI)).astype(np.float32)
+        base = now if self.target_mode == "delta" else 0.0
         return np.asarray(z, dtype=np.float32) * scale + center + base
 
     # -------------------------------------------------------------------- I/O
@@ -206,8 +256,18 @@ def fit_standardizer(store, train_mask: np.ndarray, channel_names: Sequence[str]
 
     # targets
     y = np.asarray(store.targets[idx][:, list(horizon_ids)], dtype=np.float64)
+    now = store.anchors["cgm_now"].to_numpy()[idx].reshape(-1, 1)
     if target_mode == "delta":
-        y = y - store.anchors["cgm_now"].to_numpy()[idx].reshape(-1, 1)
+        y = y - now
+    elif target_mode in LOG_TARGET_MODES:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            y = np.log(np.where(y > 0, y, np.nan))
+            if target_mode == "log_ratio":
+                y = y - np.log(np.where(now > 0, now, np.nan))
+    elif target_mode != "absolute":
+        raise ValueError(
+            f"unknown target_mode {target_mode!r}; expected delta, absolute, "
+            f"log_ratio or log")
     with np.errstate(invalid="ignore"):
         t_centre = np.nanmean(y, axis=0)
         t_scale = np.nanstd(y, axis=0)

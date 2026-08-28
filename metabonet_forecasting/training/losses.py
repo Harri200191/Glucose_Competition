@@ -58,15 +58,22 @@ class MaskedMAE(nn.Module):
 class QuantileLoss(nn.Module):
     """Pinball loss for the optional probabilistic head (plan stage 5, later phase)."""
 
-    def __init__(self, quantiles: Sequence[float]) -> None:
+    def __init__(self, quantiles: Sequence[float],
+                 horizon_weights: Optional[Sequence[float]] = None) -> None:
         super().__init__()
         self.register_buffer("q", torch.tensor(list(quantiles), dtype=torch.float32))
+        self.register_buffer(
+            "w", torch.tensor(list(horizon_weights), dtype=torch.float32)
+            if horizon_weights else torch.ones(1))
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
                 mask: torch.Tensor) -> torch.Tensor:
         err = target.unsqueeze(-1) - pred
         q = self.q.to(pred.device).reshape(1, 1, -1)
         loss = torch.maximum(q * err, (q - 1.0) * err).mean(dim=-1)
+        w = self.w.to(pred.device)
+        if w.numel() == loss.shape[1]:
+            loss = loss * w.reshape(1, -1)
         return masked_mean(loss, mask)
 
 
@@ -81,10 +88,11 @@ class HybridLoss(nn.Module):
     """
 
     def __init__(self, quantiles: Sequence[float], delta: float = 1.0,
-                 alpha: float = 1.0) -> None:
+                 alpha: float = 1.0,
+                 horizon_weights: Optional[Sequence[float]] = None) -> None:
         super().__init__()
-        self.point = MaskedHuber(delta)
-        self.pinball = QuantileLoss(quantiles)
+        self.point = MaskedHuber(delta, horizon_weights)
+        self.pinball = QuantileLoss(quantiles, horizon_weights)
         self.mid = len(list(quantiles)) // 2
         self.alpha = alpha
 
@@ -95,17 +103,30 @@ class HybridLoss(nn.Module):
 
 
 def build_loss(cfg: Dict) -> nn.Module:
+    """Build the loss named in ``training.loss``.
+
+    ``horizon_weights`` re-weights the per-horizon terms, and is the honest way
+    to spend capacity where the score is. The scorer pools all four horizons, but
+    30 min already sits near its ceiling while 120 min has several times the
+    headroom, so an unweighted loss under-invests in the horizon that decides the
+    result. Pass four numbers in the order of ``data.horizons_min``; they are
+    applied before the mask, so a horizon with no target still contributes
+    nothing. Now honoured by every loss, not only ``huber``.
+    """
     name = str(cfg.get("name", "huber")).lower()
+    hw = cfg.get("horizon_weights") or None
+    if hw is not None:
+        hw = [float(x) for x in hw]
     if name == "huber":
-        return MaskedHuber(float(cfg.get("delta", 1.0)), cfg.get("horizon_weights"))
+        return MaskedHuber(float(cfg.get("delta", 1.0)), hw)
     if name == "mse":
         return MaskedMSE()
     if name == "mae":
         return MaskedMAE()
     if name == "quantile":
-        return QuantileLoss(cfg.get("quantiles", [0.1, 0.5, 0.9]))
+        return QuantileLoss(cfg.get("quantiles", [0.1, 0.5, 0.9]), hw)
     if name == "hybrid":
         return HybridLoss(cfg.get("quantiles", [0.1, 0.5, 0.9]),
                           float(cfg.get("delta", 1.0)),
-                          float(cfg.get("alpha", 1.0)))
+                          float(cfg.get("alpha", 1.0)), hw)
     raise ValueError(f"unknown loss {name!r}")

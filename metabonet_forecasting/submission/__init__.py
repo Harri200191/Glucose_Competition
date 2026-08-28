@@ -7,5 +7,7 @@ inference features cannot drift from training features.
 """
 
 from .predict import predict_template, load_run
+from .recentre import CENTRE, fit_mu, multiplier, fit_from_predictions
 
-__all__ = ["predict_template", "load_run"]
+__all__ = ["predict_template", "load_run",
+           "CENTRE", "fit_mu", "multiplier", "fit_from_predictions"]
