@@ -1,0 +1,20 @@
+# CGM-JEPA (arXiv:2605.00933) as the CGM encoder, on the ModernTCN trunk.
+#
+# The published MIT weights are loaded strictly; fetch them once with
+#   scripts/download_cgm_fm_weights.sh
+#
+# Frozen by default. The checkpoint is 522k parameters pretrained on 228
+# subjects / ~389k readings -- tiny next to this corpus -- so a full fine-tune
+# will mostly overwrite it. Freeze first, and let the zero-initialised gate in
+# fm_encoders.py report how much of it the forecaster actually wanted.
+include: [model/moderntcn]
+
+model:
+  encoder:
+    cgm_encoder: cgm_jepa
+    fm:
+      variant: cgm_jepa      # or x_cgm_jepa, the cross-view checkpoint
+      mode: hybrid
+      freeze: true
+      input_norm: instance
+      weights: artifacts/fm_weights

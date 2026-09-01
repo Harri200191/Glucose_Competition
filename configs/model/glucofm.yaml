@@ -1,0 +1,24 @@
+# GlucoFM (arXiv:2605.30865) dual-stream CGM encoder, on the ModernTCN trunk.
+#
+# THERE IS NO PUBLIC CHECKPOINT. With weights: null this trains the architecture
+# from scratch alongside the forecaster -- a fair test of the dual-stream
+# inductive bias, and NOT a foundation-model result. To get the foundation-model
+# version, pretrain it on our own unlabeled CGM first:
+#   python -m metabonet_forecasting.fm.glucofm_pretrain --out artifacts/fm_weights/glucofm_ssl.pt
+# then set weights: to that file and freeze: true.
+include: [model/moderntcn]
+
+model:
+  encoder:
+    cgm_encoder: glucofm
+    fm:
+      mode: hybrid
+      freeze: false
+      input_norm: instance
+      weights: null
+      d_fm: 128              # paper: hidden 128, 4 heads, FFN 256, 3 layers
+      n_heads: 4
+      n_layers: 3
+      ffn: 256
+      sigma_min: 2.0         # learnable Gaussian bandwidth, in 5-minute steps
+      sigma_max: 12.0

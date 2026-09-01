@@ -110,6 +110,22 @@ model:
     cgm_differences: false
     driver_kernel: 3
     missing_embedding: false
+    # Swap the convolutional CGM encoder for a CGM foundation model. The rest of
+    # the pipeline (fusion, backbone, horizon_cross head, loss) is untouched, so
+    # a score difference is a difference in CGM representation and nothing else.
+    #   default     two causal convolutions -- the incumbent
+    #   cgm_jepa    CGM-JEPA, published MIT weights (arXiv:2605.00933)
+    #   x_cgm_jepa  the cross-view variant of the same release
+    #   glucofm     GlucoFM dual-stream architecture (arXiv:2605.30865). NO
+    #               public checkpoint exists; weights: must point at one of ours
+    #               or this is an architecture test, not a foundation model.
+    cgm_encoder: default
+    fm:
+      mode: hybrid           # hybrid = keep the convolutions and gate the FM in
+      freeze: null           # null = per-model default (JEPA frozen, GlucoFM trained)
+      use_time: false        # fusion already carries time-of-day; see fm_encoders.py
+      input_norm: instance   # mask-aware per-window z-score
+      weights: null          # null = artifacts/fm_weights for JEPA; required for GlucoFM
   fusion:
     name: film                 # raw_concat | concat | gated | film
     dropout: 0.1
