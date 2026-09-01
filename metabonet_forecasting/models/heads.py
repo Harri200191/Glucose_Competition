@@ -96,13 +96,57 @@ class HorizonCrossHead(nn.Module):
 
     Output contract matches ``MultiHorizonHead``: ``[B, H]`` point (zero-init,
     so training starts at persistence) plus optional monotone quantiles.
+
+    ``chain`` lets the horizons condition on each other instead of being read
+    off the shared memory independently, which is what they do by default --
+    the query tokens cross-attend to history but never to one another, so
+    nothing ties the 120-minute answer to the 60-minute one.
+
+      none        the default; horizons are independent given the memory.
+      causal      self-attention among the query tokens under a causal mask, so
+                  the 60-minute query sees the 30-minute query's state, 90 sees
+                  30 and 60, and so on. This is the *latent* form of feeding a
+                  prediction forward: it passes the whole representation rather
+                  than one scalar, and because every horizon is still supervised
+                  from ground truth in the same step there is no exposure bias
+                  and no error accumulation -- the two things that sink literal
+                  recursive forecasting.
+      full        the same but unmasked. Not a leak: all four are outputs at the
+                  same anchor, so letting them see each other reveals nothing
+                  about the future that the memory did not already contain.
+      cumulative  parameterise the output as a running sum, pred_k = sum_{j<=k}
+                  delta_j, so the head emits increments between horizons instead
+                  of four unrelated levels. Encodes trajectory continuity, and
+                  under target_mode=log_ratio the sum is a product of growth
+                  factors, which is the physically right composition.
+      causal_cum  both.
+      value       the LITERAL version of the idea: the model's own predicted
+                  value at horizon k-1 is projected and added to query k, so
+                  the number forecast for +30 min is an input when forecasting
+                  +60. Unlike the latent modes this is genuinely recursive, and
+                  it is included so the difference can be measured rather than
+                  argued about. It uses its OWN prediction at train time too --
+                  never the ground truth -- so there is no exposure bias, but
+                  error still accumulates along the chain, which is the cost the
+                  latent modes avoid.
     """
+
+    CHAIN_MODES = ("none", "causal", "full", "cumulative", "causal_cum", "value")
 
     def __init__(self, d_model: int, n_horizons: int,
                  future_steps: int = 0, future_channels: int = 0,
                  n_heads: int = 4, n_layers: int = 2, dropout: float = 0.0,
-                 quantiles: Optional[Sequence[float]] = None) -> None:
+                 quantiles: Optional[Sequence[float]] = None,
+                 chain: str = "none") -> None:
         super().__init__()
+        self.chain = str(chain)
+        if self.chain not in self.CHAIN_MODES:
+            raise ValueError(f"head.chain must be one of {self.CHAIN_MODES}, "
+                             f"got {chain!r}")
+        self.chain_attends = self.chain in ("causal", "full", "causal_cum")
+        self.chain_causal = self.chain in ("causal", "causal_cum")
+        self.chain_cumulative = self.chain in ("cumulative", "causal_cum")
+        self.chain_value = self.chain == "value"
         self.n_horizons = n_horizons
         self.quantiles = list(quantiles) if quantiles else []
         self.future_steps = future_steps
@@ -126,6 +170,22 @@ class HorizonCrossHead(nn.Module):
                     nn.Linear(d_model, 2 * d_model), nn.GELU(),
                     nn.Dropout(dropout), nn.Linear(2 * d_model, d_model)),
             }))
+            if self.chain_attends:
+                # Zero-init the output projection so an untrained chain layer is
+                # the identity: chain=causal starts life numerically equal to
+                # chain=none and can only earn its way in.
+                sa = nn.MultiheadAttention(d_model, n_heads, dropout=dropout,
+                                           batch_first=True)
+                nn.init.zeros_(sa.out_proj.weight)
+                nn.init.zeros_(sa.out_proj.bias)
+                self.blocks[-1]["ln_c"] = nn.LayerNorm(d_model)
+                self.blocks[-1]["chain"] = sa
+        # Feeds the previous horizon's predicted value back in. Zero-init, so
+        # chain=value also starts numerically identical to chain=none.
+        if self.chain_value:
+            self.value_proj = nn.Linear(1, d_model)
+            nn.init.zeros_(self.value_proj.weight)
+            nn.init.zeros_(self.value_proj.bias)
         self.out_norm = nn.LayerNorm(d_model)
         self.out = nn.Linear(d_model, 1 + len(self.quantiles))
         nn.init.zeros_(self.out.weight)
@@ -141,13 +201,37 @@ class HorizonCrossHead(nn.Module):
             memory = torch.cat([memory, fut], dim=1)
         q = self.queries.unsqueeze(0).expand(B, -1, -1) \
             + self.anchor_proj(seq[:, -1]).unsqueeze(1)
+        cmask = None
+        if self.chain_causal:
+            cmask = torch.triu(torch.ones(self.n_horizons, self.n_horizons,
+                                          dtype=torch.bool, device=q.device),
+                               diagonal=1)
         for blk in self.blocks:
             attn_out, _ = blk["attn"](blk["ln_q"](q), blk["ln_m"](memory),
                                       blk["ln_m"](memory), need_weights=False)
             q = q + attn_out
+            if self.chain_attends:
+                h = blk["ln_c"](q)
+                chain_out, _ = blk["chain"](h, h, h, attn_mask=cmask,
+                                            need_weights=False)
+                q = q + chain_out
             q = q + blk["ffn"](blk["ln_f"](q))
-        out = self.out(self.out_norm(q))                     # [B, H, 1+Q]
+        if self.chain_value:
+            # Sequential by necessity: horizon k's input contains horizon k-1's
+            # output. Four steps, so the cost is negligible.
+            steps = []
+            prev = q.new_zeros(q.shape[0], 1)
+            for k in range(self.n_horizons):
+                qk = self.out_norm(q[:, k] + self.value_proj(prev))
+                ok = self.out(qk)                            # [B, 1+Q]
+                steps.append(ok)
+                prev = ok[..., :1]
+            out = torch.stack(steps, dim=1)                  # [B, H, 1+Q]
+        else:
+            out = self.out(self.out_norm(q))                 # [B, H, 1+Q]
         point = out[..., 0]
+        if self.chain_cumulative:
+            point = torch.cumsum(point, dim=1)
         if not self.quantiles:
             return point, None
         return point, _monotone_quantiles(point, out[..., 1:],

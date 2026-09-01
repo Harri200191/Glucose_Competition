@@ -116,6 +116,56 @@ class TimesFMBackend(Backend):
         return np.asarray(point)[:, :PRED_STEPS]
 
 
+class TimesFM3Backend(Backend):
+    """TimesFM 3.0 (Google, Aug 2026): 330M decoder-only, natively multivariate.
+
+    The first zero-shot backend here besides Chronos-2 that can read covariates
+    it knows into the future, which is what makes the planned-insulin channels
+    usable without training anything. Verified against the installed package:
+
+      predict_batch(contexts=[T], horizon=H,
+                    past_only_covariates=[[n, T]],
+                    past_future_covariates=[[n, T + H]])
+
+    Covariates are VARIATE-FIRST -- ``[n_cov, steps]``. The ``[steps, n_cov]``
+    layout raises "Decode function requires horizon > 0", which is not a shape
+    error message you would guess from, so it is pinned here by test.
+
+    A channel present in both ``past_cov`` and ``fut_cov`` becomes a
+    past-future covariate (its future is genuinely known: it is the planned
+    dose); one present only in the past becomes past-only. NaN is forward
+    filled -- the model takes no missing mask.
+    """
+
+    supports_covariates = True
+
+    def __init__(self, model_id: str, device: str) -> None:
+        import timesfm
+        self.name = model_id
+        self.model = timesfm.TimesFM3Forecaster.from_pretrained(
+            model_id, device=device)
+
+    def predict(self, context: np.ndarray, past_cov=None,
+                fut_cov=None) -> np.ndarray:
+        ctx = [row for row in _ffill(context)]
+        b = len(ctx)
+        pf = po = None
+        if past_cov:
+            both = [k for k in past_cov if fut_cov and k in fut_cov]
+            only = [k for k in past_cov if k not in set(both)]
+            if both:
+                pf = [np.stack([np.concatenate([past_cov[k][i], fut_cov[k][i]])
+                                for k in both]).astype(np.float32)
+                      for i in range(b)]
+            if only:
+                po = [np.stack([past_cov[k][i] for k in only]).astype(np.float32)
+                      for i in range(b)]
+        out = self.model.predict_batch(
+            contexts=ctx, horizon=PRED_STEPS,
+            past_only_covariates=po, past_future_covariates=pf)
+        return np.stack([np.asarray(o.forecast)[:PRED_STEPS] for o in out])
+
+
 class TiRexBackend(Backend):
     """TiRex (NX-AI, 2025): xLSTM-based zero-shot forecaster."""
 
@@ -139,6 +189,7 @@ BACKENDS = {
     "chronos-bolt-small": (ChronosBackend, "amazon/chronos-bolt-small"),
     "chronos2":          (Chronos2Backend, "amazon/chronos-2"),
     "timesfm":           (TimesFMBackend, "google/timesfm-2.5-200m-pytorch"),
+    "timesfm3":          (TimesFM3Backend, "google/timesfm-3.0-pytorch"),
     "tirex":             (TiRexBackend, "NX-AI/TiRex"),
 }
 

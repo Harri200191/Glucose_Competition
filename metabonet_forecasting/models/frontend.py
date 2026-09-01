@@ -26,6 +26,7 @@ from .base import ForecastModel, ForecastOutput
 from .encoders import (FutureActionEncoder, StaticEncoder, TimeEncoder,
                        build_modality_encoders)
 from .fusion import build_fusion
+from .physio import PhysioFeatures
 from .heads import HorizonCrossHead, MultiHorizonHead
 
 
@@ -59,6 +60,16 @@ class FrontEndForecaster(ForecastModel):
         self.fusion_name = str(fusion_cfg.get("name", "film"))
         self.d_model = d_model
         self.channel_counts: Dict[str, int] = dict(shapes["channel_counts"])
+        # Physiological channels derived from CGM + insulin, no meal log needed.
+        # Appended to the CGM block before its encoder, so the encoder just sees
+        # a wider input and nothing downstream changes.
+        physio_cfg = dict(model_cfg.get("physio", {}) or {})
+        self.physio = (PhysioFeatures(
+            float(physio_cfg.get("ema_halflife_steps", 6.0)))
+            if physio_cfg.get("enabled") else None)
+        if self.physio is not None:
+            self.channel_counts["cgm"] = \
+                int(self.channel_counts.get("cgm", 0)) + self.physio.n_out
         self.modalities: List[str] = [m for m in self.channel_counts if
                                       self.channel_counts[m] > 0]
         self.context = int(shapes["context"])
@@ -108,7 +119,10 @@ class FrontEndForecaster(ForecastModel):
                 n_heads=int(head_cfg.get("n_heads", 4)),
                 n_layers=int(head_cfg.get("n_layers", 2)),
                 dropout=float(head_cfg.get("dropout", 0.0)),
-                quantiles=head_cfg.get("quantiles"))
+                quantiles=head_cfg.get("quantiles"),
+                # `--set model.head.chain=none` is coerced to Python None by
+                # the config parser, which is the same thing the user meant.
+                chain=str(head_cfg.get("chain") or "none"))
         else:
             # Planned future actions, only if this run asked for them.
             self.future_encoder = _build_future_encoder(shapes, model_cfg, encoder_cfg)
@@ -120,6 +134,13 @@ class FrontEndForecaster(ForecastModel):
                 quantiles=head_cfg.get("quantiles"), d_extra=d_extra)
 
     # ---------------------------------------------------------------- forward
+    def _cgm_in(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """The CGM block, widened with physiological channels when enabled."""
+        x = batch["x_cgm"]
+        if self.physio is None:
+            return x
+        return torch.cat([x, self.physio(x, batch.get("x_insulin"))], dim=-1)
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> ForecastOutput:
         static = None
         if self.static_encoder is not None:
@@ -129,7 +150,8 @@ class FrontEndForecaster(ForecastModel):
             time = self.time_encoder(batch.get("time"))
 
         if self.fusion is None:
-            parts = [batch[f"x_{m}"] for m in self.modalities]
+            parts = [self._cgm_in(batch) if m == "cgm" else batch[f"x_{m}"]
+                     for m in self.modalities]
             length = parts[0].shape[1]
             if static is not None:
                 parts.append(static.unsqueeze(1).expand(-1, length, -1))
@@ -137,8 +159,18 @@ class FrontEndForecaster(ForecastModel):
                 parts.append(time)
             z = self.input_proj(torch.cat(parts, dim=-1))
         else:
-            encoded = {m: self.encoders[m](batch[f"x_{m}"], batch.get(f"m_{m}"))
-                       for m in self.modalities}
+            # A CGM foundation-model encoder rebuilds calendar features itself
+            # (its pretrained projection expects its own layout), so it is handed
+            # the raw time block; every other encoder keeps the two-argument
+            # signature untouched.
+            encoded = {}
+            for m in self.modalities:
+                enc = self.encoders[m]
+                xm = self._cgm_in(batch) if m == "cgm" else batch[f"x_{m}"]
+                if getattr(enc, "wants_time", False):
+                    encoded[m] = enc(xm, batch.get(f"m_{m}"), batch.get("time"))
+                else:
+                    encoded[m] = enc(xm, batch.get(f"m_{m}"))
             z = self.fusion(encoded, static=static, time=time)
 
         seq = self.backbone(z)
@@ -156,11 +188,16 @@ class FrontEndForecaster(ForecastModel):
 
     def describe(self) -> Dict[str, object]:
         d = super().describe()
-        d.update({"backbone": self.backbone_name, "fusion": self.fusion_name,
+        d.update({"physio": self.physio.describe() if self.physio else None,
+                  "backbone": self.backbone_name, "fusion": self.fusion_name,
                   "head": self.head_name,
                   "d_model": self.d_model, "modalities": self.modalities,
                   "context": self.context,
                   "future_covariates": self.future_encoder is not None
                   or (self.head_name == "horizon_cross"
                       and getattr(self.head, "future_proj", None) is not None)})
+        if self.encoders is not None:
+            for m, enc in self.encoders.items():
+                if hasattr(enc, "fm_summary"):
+                    d[f"fm_{m}"] = enc.fm_summary()
         return d

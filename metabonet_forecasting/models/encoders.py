@@ -209,9 +209,20 @@ def build_modality_encoders(channel_counts: Dict[str, int], d_model: int,
         if n_ch == 0:
             continue
         if name == "cgm":
-            enc[name] = CGMEncoder(n_ch, d_model, hidden=cfg.get("cgm_hidden"),
-                                   use_differences=bool(cfg.get("cgm_differences", False)),
-                                   missing_embedding=missing_emb, dropout=dropout)
+            local = dict(hidden=cfg.get("cgm_hidden"),
+                         use_differences=bool(cfg.get("cgm_differences", False)),
+                         missing_embedding=missing_emb)
+            kind = str(cfg.get("cgm_encoder", "default") or "default")
+            if kind == "default":
+                enc[name] = CGMEncoder(n_ch, d_model, dropout=dropout, **local)
+            else:
+                # A CGM foundation model (CGM-JEPA / GlucoFM) stands in for the
+                # convolutional encoder. Imported lazily so a run that does not
+                # ask for one never pays for torch-hub/safetensors imports.
+                from .fm_encoders import build_fm_cgm_encoder
+                enc[name] = build_fm_cgm_encoder(
+                    kind, n_ch, d_model, dict(cfg.get("fm", {}) or {}),
+                    dropout, local_kwargs=local)
         else:
             enc[name] = DriverEncoder(n_ch, d_model, hidden=cfg.get("driver_hidden"),
                                       kernel_size=int(cfg.get("driver_kernel", 3)),

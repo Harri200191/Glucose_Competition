@@ -25,7 +25,7 @@ from ..common.logging import RunLogger
 from ..data.splits import seen_in_train
 from ..data.windows import batch_to_device
 from .callbacks import Checkpointer, EarlyStopping, WarmupCosine
-from .losses import build_loss
+from .losses import build_loss, build_loss_with_zone
 
 
 class Trainer:
@@ -48,7 +48,18 @@ class Trainer:
         self.log_every = int(t.get("log_every", 200))
 
         loss_cfg = dict(t.get("loss", {"name": "huber"}))
+        # Zone A is |log(pred/true)| <= 0.2027. The target standardiser divides
+        # model-space values by target_scale, so the window shrinks by the same
+        # factor -- which is why the half-width is computed here and not in the
+        # config. Only a log target mode makes the surrogate a zone-A stand-in.
+        self._zone_cfg = loss_cfg
         self.criterion = build_loss(loss_cfg)
+        # Frequency-domain augmentation (FrAug-style). Time-domain transforms --
+        # jitter, scaling, warping -- are documented to help classification and
+        # NOT forecasting, because they break the fine temporal structure the
+        # forecast depends on. Masking spectral components does not.
+        self.freq_mask_p = float(t.get("freq_mask_p", 0.0) or 0.0)
+        self._init_zone_loss()
         self.quantile_loss = str(loss_cfg.get("name", "")).lower() in ("quantile", "hybrid")
         if self.quantile_loss and not cfg.get_path("model.head.quantiles", None):
             raise ValueError(
@@ -118,20 +129,77 @@ class Trainer:
         return {"history": history, "best_epoch": self.early.best_epoch,
                 "best_val_rmse": float(self.early.best_value)}
 
+    def _init_zone_loss(self) -> None:
+        """Rebuild the criterion with the zone-A surrogate, once the
+        standardiser is known."""
+        cfg = self._zone_cfg
+        if float(cfg.get("zone_weight", 0.0) or 0.0) <= 0:
+            return
+        std = getattr(self.bundle, "standardizer", None)
+        mode = str(getattr(std, "target_mode", "delta"))
+        if mode not in ("log_ratio", "log"):
+            raise ValueError(
+                f"training.loss.zone_weight needs a log target mode (got "
+                f"data.target_mode={mode!r}): zone A is a relative band, so the "
+                "surrogate only stands in for it in log space.")
+        import numpy as _np
+        scale = _np.maximum(_np.asarray(std.target_scale, dtype=_np.float32), 1e-6)
+        cfg = dict(cfg); cfg["zone_halfwidth"] = (0.2027 / scale).tolist()
+        self.criterion = build_loss_with_zone(cfg).to(self.device)
+        self.log.info("zone-A surrogate on: weight=%s halfwidth(model space)=%s"
+                      % (cfg["zone_weight"],
+                         [round(float(v), 4) for v in cfg["zone_halfwidth"]]))
+
+    def _freq_augment(self, batch):
+        """Randomly drop spectral components of the CGM context (training only).
+
+        rFFT the value channel, zero a random subset of frequency bins, invert.
+        The observation mask and all other channels are untouched, and the
+        targets are never touched at all.
+        """
+        x = batch.get("x_cgm")
+        if x is None or x.shape[-1] == 0:
+            return batch
+        v = x[..., 0].float()
+        f = torch.fft.rfft(v, dim=1)
+        keep = (torch.rand(f.shape, device=f.device) >= self.freq_mask_p)
+        keep[:, 0] = True                    # keep the mean; dropping it shifts level
+        v2 = torch.fft.irfft(f * keep, n=v.shape[1], dim=1).to(x.dtype)
+        batch = dict(batch)
+        batch["x_cgm"] = torch.cat([v2.unsqueeze(-1), x[..., 1:]], dim=-1)
+        return batch
+
     def _train_epoch(self, loader, steps: int, epoch: int) -> float:
         self.model.train()
-        total, n = 0.0, 0
+        total, n, n_bad = 0.0, 0, 0
         self.optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(loader):
             if step >= steps:
                 break
             batch = batch_to_device(batch, self.device)
+            if self.freq_mask_p > 0.0:
+                batch = self._freq_augment(batch)
             with torch.amp.autocast(self.device.type, enabled=self.amp):
                 out = self.model(batch)
                 target = batch["y_norm"]
                 mask = batch["y_mask"]
                 pred = out.quantiles if self.quantile_loss else out.pred_norm
                 loss = self.criterion(pred, target, mask)
+            # A single non-finite batch used to poison the reported loss for the
+            # rest of the epoch, because the log prints a RUNNING MEAN: once
+            # `total` is NaN it stays NaN however healthy the next 20,000 steps
+            # are. Skip the batch, count it, and leave the average truthful.
+            # (GradScaler already declines to apply non-finite gradients, so
+            # this is about honest reporting and wasted work, not weight safety.)
+            if not torch.isfinite(loss):
+                n_bad += 1
+                if n_bad in (1, 10, 100, 1000):
+                    self.log.warning(
+                        f"  epoch {epoch} step {step}: non-finite loss "
+                        f"({n_bad} so far this epoch) -- batch skipped")
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
             self.scaler.scale(loss / self.accumulate).backward()
 
             if (step + 1) % self.accumulate == 0:
@@ -147,8 +215,14 @@ class Trainer:
             total += float(loss.detach()) * mask.shape[0]
             n += mask.shape[0]
             if self.log_every and step and step % self.log_every == 0:
+                bad = f"  [{n_bad} non-finite skipped]" if n_bad else ""
                 self.log.info(f"  epoch {epoch} step {step}/{steps} "
-                              f"loss {total / max(n, 1):.4f}")
+                              f"loss {total / max(n, 1):.4f}{bad}")
+        if n_bad:
+            self.log.warning(
+                f"  epoch {epoch}: {n_bad}/{steps} batches had a non-finite loss "
+                f"and were skipped. A handful is a bad batch; a rising count is "
+                f"divergence -- lower training.lr or raise training.warmup_steps.")
         return total / max(n, 1)
 
     # -------------------------------------------------------------- inference
