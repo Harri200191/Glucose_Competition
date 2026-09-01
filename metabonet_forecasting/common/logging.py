@@ -93,6 +93,10 @@ class RunLogger:
         self.console.info(msg)
         self.event("log", message=msg)
 
+    def warning(self, msg: str) -> None:
+        self.console.warning(msg)
+        self.event("log", level="warning", message=msg)
+
     def event(self, kind: str, **fields: Any) -> None:
         rec = {"t": round(time.time() - self._t0, 3), "kind": kind}
         rec.update(fields)
