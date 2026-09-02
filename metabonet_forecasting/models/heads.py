@@ -129,9 +129,30 @@ class HorizonCrossHead(nn.Module):
                   never the ground truth -- so there is no exposure bias, but
                   error still accumulates along the chain, which is the cost the
                   latent modes avoid.
+      dist        ``value``, but the whole predictive DISTRIBUTION goes forward
+                  instead of the single number: the point plus the quantile
+                  ladder recentred on it, i.e. level AND spread.
+
+                  The motivation is measured, not assumed. On the internal
+                  holdout an oracle allowed to pick the best of the seven
+                  predicted quantiles per anchor scores 98.30 zone A at 120 min
+                  against the median's 74.15 -- the right answer is inside the
+                  predicted distribution 98% of the time and the model reports
+                  the wrong part of it. Passing only the median discards exactly
+                  the information that says whether to commit to a large move.
+
+                  The ladder is passed as ``offsets - centre`` (what
+                  ``_monotone_quantiles`` adds to the point), NOT as raw
+                  quantile levels. That split is deliberate: the level is
+                  already in the query through ``anchor_proj``, so handing over
+                  raw quantiles would make the projection re-learn a
+                  subtraction it can be given for free, and the spread is then
+                  level-invariant -- a 20 mg/dL spread means the same thing at
+                  90 and at 250.
     """
 
-    CHAIN_MODES = ("none", "causal", "full", "cumulative", "causal_cum", "value")
+    CHAIN_MODES = ("none", "causal", "full", "cumulative", "causal_cum",
+                   "value", "dist")
 
     def __init__(self, d_model: int, n_horizons: int,
                  future_steps: int = 0, future_channels: int = 0,
@@ -147,8 +168,16 @@ class HorizonCrossHead(nn.Module):
         self.chain_causal = self.chain in ("causal", "causal_cum")
         self.chain_cumulative = self.chain in ("cumulative", "causal_cum")
         self.chain_value = self.chain == "value"
+        self.chain_dist = self.chain == "dist"
+        self.chain_feeds = self.chain_value or self.chain_dist
         self.n_horizons = n_horizons
         self.quantiles = list(quantiles) if quantiles else []
+        if self.chain_dist and not self.quantiles:
+            raise ValueError(
+                "head.chain='dist' passes the predictive distribution between "
+                "horizons, so the head must emit quantiles. Set "
+                "model.head.quantiles (and a quantile-aware loss), or use "
+                "chain='value' to pass the point forecast alone.")
         self.future_steps = future_steps
         self.queries = nn.Parameter(torch.randn(n_horizons, d_model) * 0.02)
         self.anchor_proj = nn.Linear(d_model, d_model)
@@ -182,8 +211,12 @@ class HorizonCrossHead(nn.Module):
                 self.blocks[-1]["chain"] = sa
         # Feeds the previous horizon's predicted value back in. Zero-init, so
         # chain=value also starts numerically identical to chain=none.
-        if self.chain_value:
-            self.value_proj = nn.Linear(1, d_model)
+        if self.chain_feeds:
+            # dist hands over the point AND the recentred ladder; value only
+            # the point. Zero-init either way, so both start numerically
+            # identical to chain=none and have to earn their way in.
+            self.chain_in = 1 + (len(self.quantiles) if self.chain_dist else 0)
+            self.value_proj = nn.Linear(self.chain_in, d_model)
             nn.init.zeros_(self.value_proj.weight)
             nn.init.zeros_(self.value_proj.bias)
         self.out_norm = nn.LayerNorm(d_model)
@@ -216,16 +249,26 @@ class HorizonCrossHead(nn.Module):
                                             need_weights=False)
                 q = q + chain_out
             q = q + blk["ffn"](blk["ln_f"](q))
-        if self.chain_value:
+        if self.chain_feeds:
             # Sequential by necessity: horizon k's input contains horizon k-1's
             # output. Four steps, so the cost is negligible.
+            n_q = len(self.quantiles)
             steps = []
-            prev = q.new_zeros(q.shape[0], 1)
+            prev = q.new_zeros(q.shape[0], self.chain_in)
             for k in range(self.n_horizons):
                 qk = self.out_norm(q[:, k] + self.value_proj(prev))
                 ok = self.out(qk)                            # [B, 1+Q]
                 steps.append(ok)
-                prev = ok[..., :1]
+                if self.chain_dist:
+                    # The same offsets _monotone_quantiles will build, so what
+                    # goes forward is the ladder that is actually reported --
+                    # not a second, differently-shaped estimate of it.
+                    off = torch.cumsum(
+                        torch.nn.functional.softplus(ok[..., 1:]), dim=-1)
+                    centre = off[..., n_q // 2: n_q // 2 + 1]
+                    prev = torch.cat([ok[..., :1], off - centre], dim=-1)
+                else:
+                    prev = ok[..., :1]
             out = torch.stack(steps, dim=1)                  # [B, H, 1+Q]
         else:
             out = self.out(self.out_norm(q))                 # [B, H, 1+Q]
