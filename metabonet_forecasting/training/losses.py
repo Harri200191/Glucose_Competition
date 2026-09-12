@@ -66,22 +66,51 @@ def _move_weights(target: torch.Tensor, strength: float) -> Optional[torch.Tenso
     return w / w.mean().clamp_min(1e-6)
 
 
+def _huber(err: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+    """Huber with a PER-HORIZON delta. ``delta`` broadcasts against ``err``."""
+    a = err.abs()
+    return torch.where(a <= delta, 0.5 * err * err, delta * (a - 0.5 * delta))
+
+
 class MaskedHuber(nn.Module):
-    """Huber on standardised targets. Robust to the tail of sensor artefacts."""
+    """Huber on standardised targets. Robust to the tail of sensor artefacts.
+
+    ``delta`` accepts a list, one value per horizon, and that is not cosmetic.
+    Targets are standardised per horizon (``target_scale`` = 0.20/0.30/0.36/0.40
+    for 30/60/90/120 min), while zone A is a fixed RELATIVE band: accepted
+    predictions are 0.8x to 1.2x the truth, i.e. |log ratio| <= ~0.2 whatever the
+    horizon. Divide one by the other and the metric's decision boundary sits at
+
+        1.04 / 0.68 / 0.56 / 0.50   standardised units, for 30/60/90/120 min
+
+    so a single delta=1.0 lands exactly on the boundary at 30 min and twice
+    beyond it at 120 min. Past the boundary the anchor has already left zone A
+    and further error costs the metric nothing -- but a quadratic loss keeps
+    paying attention proportional to the error. Measured on c96_mamba2's test
+    predictions: at 120 min the 23.9% of anchors already outside zone A absorb
+    **85.4%** of the squared error, and at 30 min -- the horizon that is already
+    near its ceiling -- only 61%.
+
+    Setting delta to the per-horizon boundary aligns where the loss stops growing
+    with where the metric stops caring.
+    """
 
     def __init__(self, delta: float = 1.0,
                  horizon_weights: Optional[Sequence[float]] = None,
                  move_weight: float = 0.0) -> None:
         super().__init__()
-        self.delta = delta
         self.move_weight = float(move_weight)
+        d = [float(x) for x in delta] if isinstance(delta, (list, tuple)) else [float(delta)]
+        self.register_buffer("delta", torch.tensor(d, dtype=torch.float32))
         self.register_buffer(
             "w", torch.tensor(list(horizon_weights), dtype=torch.float32)
             if horizon_weights else torch.ones(1))
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
                 mask: torch.Tensor) -> torch.Tensor:
-        loss = F.huber_loss(pred, target, reduction="none", delta=self.delta)
+        d = self.delta.to(pred.device)
+        d = d.reshape(1, -1) if d.numel() == pred.shape[1] else d.reshape(1, 1)
+        loss = _huber(pred - target, d)
         w = self.w.to(pred.device)
         if w.numel() == pred.shape[1]:
             loss = loss * w.reshape(1, -1)
@@ -158,7 +187,7 @@ class HybridLoss(nn.Module):
     the distribution. ``alpha`` weights the pinball term.
     """
 
-    def __init__(self, quantiles: Sequence[float], delta: float = 1.0,
+    def __init__(self, quantiles: Sequence[float], delta=1.0,
                  alpha: float = 1.0,
                  horizon_weights: Optional[Sequence[float]] = None,
                  move_weight: float = 0.0) -> None:
@@ -190,8 +219,11 @@ def build_loss(cfg: Dict) -> nn.Module:
     if hw is not None:
         hw = [float(x) for x in hw]
     mw = float(cfg.get("move_weight", 0.0) or 0.0)
+    # delta may be a scalar or one value per horizon; MaskedHuber documents why.
+    _d = cfg.get("delta", 1.0)
+    delta = [float(x) for x in _d] if isinstance(_d, (list, tuple)) else float(_d)
     if name == "huber":
-        return MaskedHuber(float(cfg.get("delta", 1.0)), hw, mw)
+        return MaskedHuber(delta, hw, mw)
     if name == "mse":
         return MaskedMSE()
     if name == "mae":
@@ -199,8 +231,7 @@ def build_loss(cfg: Dict) -> nn.Module:
     if name == "quantile":
         return QuantileLoss(cfg.get("quantiles", [0.1, 0.5, 0.9]), hw, mw)
     if name == "hybrid":
-        return HybridLoss(cfg.get("quantiles", [0.1, 0.5, 0.9]),
-                          float(cfg.get("delta", 1.0)),
+        return HybridLoss(cfg.get("quantiles", [0.1, 0.5, 0.9]), delta,
                           float(cfg.get("alpha", 1.0)), hw, mw)
     raise ValueError(f"unknown loss {name!r}")
 
