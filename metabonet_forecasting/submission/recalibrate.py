@@ -140,6 +140,12 @@ def main(argv=None) -> int:
     ap.add_argument("--fit-weights", action="store_true",
                     help="fit per-horizon simplex weights on the targets "
                          "instead of using fixed --weights")
+    ap.add_argument("--weight-step", type=float, default=0.05,
+                    help="simplex resolution for --fit-weights. Cost is the number "
+                         "of lattice points, C(1/step + M-1, M-1): with 4 members "
+                         "0.05 is 1,771 points and 0.1 is 286. The 3-member fit "
+                         "landed on 0.4/0.1/0.5 -- every weight a multiple of 0.1 -- "
+                         "so 0.05 bought nothing there and costs 6x here.")
     ap.add_argument("--affine", action="store_true",
                     help="fit (multiplier, offset) per bin instead of "
                          "multiplier only")
@@ -160,7 +166,7 @@ def main(argv=None) -> int:
         ref = targets[tcol].to_numpy(float)
         if a.fit_weights and len(frames) > 1:
             stack = np.stack([f[col].to_numpy(float) for f in frames])
-            w = fit_weights(stack, ref)
+            w = fit_weights(stack, ref, step=a.weight_step)
             horizon_weights[h] = [round(float(x), 3) for x in w]
             pred = np.einsum("m,mn->n", w, stack)
             print(f"h={h:>3}: fitted weights {horizon_weights[h]}")
