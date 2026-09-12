@@ -729,3 +729,140 @@ def subsample_mask(mask: np.ndarray, max_items: Optional[int], seed: int = 0,
     out = np.zeros_like(mask)
     out[np.sort(keep)] = True
     return out
+
+
+# --------------------------------------------------------------- mix sampling
+# Anchors are not drawn from the distribution the model is scored on. 13.1% of
+# the ctx1152 training pool sits in cohorts that never appear on the live
+# leaderboard (DCLP3, DCLP5, Flair, T1D-UOM, OhioT1DM) and Loop is 64.8% of
+# training against 76.8% of the evaluation. These helpers let a run choose the
+# mix explicitly instead of inheriting whatever prepare.py happened to write.
+
+EXCURSION_EDGES = (-60.0, -25.0, 25.0, 60.0)
+EXCURSION_NAMES = ("big_fall", "fall", "flat", "rise", "big_rise")
+GLYCAEMIA_EDGES = (54.0, 70.0, 180.0, 250.0)
+GLYCAEMIA_NAMES = ("hypo_l2", "hypo_l1", "in_range", "hyper_l1", "hyper_l2")
+
+# Anchors with no label at the keying horizon. Never reweighted -- they ride at
+# whatever rate the labelled anchors end up keeping, so a mix arm differs from
+# its control in the mix and in nothing else.
+UNLABELLED = -1
+
+
+def mix_strata(store, by: str, horizon_min: int = 120) -> Tuple[np.ndarray, List[str]]:
+    """Integer stratum per anchor, plus the stratum names.
+
+    ``cohort`` is a property of the anchor. ``excursion`` and ``glycaemia`` read
+    targets.npy, so they are training-time keys only -- legitimate for choosing
+    WHICH anchors to train on, and not legitimate as a feature.
+    """
+    if by == "cohort":
+        return store.anchors["cohort"].to_numpy(np.int64), list(store.cohort_names())
+    hid = int(store.horizon_ids([horizon_min])[0])
+    y = np.asarray(store.targets[:, hid], dtype=float)
+    ok = np.isfinite(y)
+    if by == "glycaemia":
+        s = np.digitize(y, GLYCAEMIA_EDGES)
+        names = list(GLYCAEMIA_NAMES)
+    elif by == "excursion":
+        s = np.digitize(y - store.anchors["cgm_now"].to_numpy(float), EXCURSION_EDGES)
+        names = list(EXCURSION_NAMES)
+    else:
+        raise ValueError(f"unknown mix key {by!r}; use cohort|excursion|glycaemia")
+    return np.where(ok, s, UNLABELLED).astype(np.int64), names
+
+
+def stratified_subsample(mask: np.ndarray, strata: np.ndarray, names: Sequence[str],
+                         target: Optional[Dict[str, float]] = None,
+                         drop: Sequence[str] = (),
+                         max_items: Optional[int] = None,
+                         seed: int = 0,
+                         subjects: Optional[np.ndarray] = None
+                         ) -> Tuple[np.ndarray, str]:
+    """Resample ``mask`` so the kept anchors follow ``target`` over ``strata``.
+
+    Two modes. ``drop`` removes strata and leaves the rest at natural
+    proportions; ``target`` names relative weights and gives every unnamed
+    stratum weight zero.
+
+    A boolean mask cannot duplicate an anchor, so a stratum is only ever
+    DOWN-sampled -- the target mix is reached by thinning what is
+    over-represented. That makes ``max_items`` load bearing: without a cap, the
+    only way to raise one cohort's share is to discard the others outright.
+    """
+    code = {n: i for i, n in enumerate(names)}
+    unknown = [k for k in list(target or {}) + list(drop) if k not in code]
+    if unknown:
+        raise ValueError(f"unknown strata {unknown}; have {list(code)}")
+
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return mask, "mix: empty mask, nothing to do"
+    s = strata[idx]
+    lab = s != UNLABELLED
+    avail = {int(c): int((s == c).sum()) for c in np.unique(s[lab])}
+
+    if target:
+        w = {c: float(target.get(names[c], 0.0)) for c in avail}
+    else:
+        w = {c: float(avail[c]) for c in avail}
+    for d in drop:
+        w[code[d]] = 0.0
+    if sum(w.values()) <= 0:
+        raise ValueError("mix leaves every stratum at weight zero")
+
+    budget = int(max_items) if max_items else int(lab.sum())
+    budget = min(budget, int(lab.sum()))
+
+    # Quotas, with the shortfall from strata that cannot fill their share handed
+    # back to the strata that still have headroom. Repeated because handing back
+    # can itself overflow another stratum.
+    keep_n = {c: 0 for c in avail}
+    live = {c for c in avail if w[c] > 0}
+    left = budget
+    for _ in range(8):
+        tw = sum(w[c] for c in live)
+        if not live or tw <= 0 or left <= 0:
+            break
+        filled = []
+        for c in sorted(live):
+            q = int(round(left * w[c] / tw))
+            if q >= avail[c] - keep_n[c]:
+                keep_n[c] = avail[c]
+                filled.append(c)
+        if not filled:
+            for c in sorted(live):
+                keep_n[c] = min(avail[c], keep_n[c] + int(round(left * w[c] / tw)))
+            break
+        left = budget - sum(keep_n.values())
+        live -= set(filled)
+
+    rng = np.random.default_rng(seed)
+    parts: List[np.ndarray] = []
+    for c, n in keep_n.items():
+        if n <= 0:
+            continue
+        here = idx[s == c]
+        sub = np.zeros_like(mask)
+        sub[here] = True
+        sub = subsample_mask(sub, n, seed + 1 + int(c), subjects)
+        parts.append(np.flatnonzero(sub))
+
+    kept_lab = int(sum(p.size for p in parts))
+    # Unlabelled anchors ride at the same rate, so the arm differs only in mix.
+    n_unlab = int((~lab).sum())
+    if n_unlab:
+        rate = kept_lab / max(int(lab.sum()), 1)
+        take = int(round(rate * n_unlab))
+        if take > 0:
+            parts.append(rng.choice(idx[~lab], size=min(take, n_unlab), replace=False))
+
+    keep = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+    out = np.zeros_like(mask)
+    out[np.sort(keep)] = True
+
+    tot = max(kept_lab, 1)
+    shown = ", ".join(f"{names[c]} {100 * keep_n[c] / tot:.1f}%"
+                      for c in sorted(keep_n, key=lambda k: -keep_n[k]) if keep_n[c])
+    return out, (f"mix: {int(mask.sum()):,} -> {int(out.sum()):,} anchors "
+                 f"({kept_lab:,} labelled); realised mix: {shown}")
