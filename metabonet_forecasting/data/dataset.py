@@ -136,7 +136,22 @@ def build_data(cfg: Config, standardizer: Optional[Standardizer] = None) -> Data
     subjects = store.anchors["subject"].to_numpy()
 
     train = _thin(split["train"], int(sampling.get("train_stride", 1)))
-    train = S.subsample_mask(train, sampling.get("max_train_windows"), seed, subjects)
+    mix = dict(sampling.get("mix", {}) or {})
+    if mix:
+        # Choose the training mix explicitly rather than inheriting whatever the
+        # store happened to contain. Train only -- val and test keep their own
+        # composition, so the rulers do not move with the arm.
+        mix_key, mix_names = S.mix_strata(store, str(mix.get("by", "cohort")),
+                                          int(mix.get("horizon_min", 120)))
+        train, mnote = S.stratified_subsample(
+            train, mix_key, mix_names,
+            target=dict(mix.get("target", {}) or {}) or None,
+            drop=list(mix.get("drop", []) or []),
+            max_items=sampling.get("max_train_windows"),
+            seed=seed, subjects=subjects)
+        LOG.info(mnote)
+    else:
+        train = S.subsample_mask(train, sampling.get("max_train_windows"), seed, subjects)
     val = S.subsample_mask(split["val"], sampling.get("max_val_windows"), seed + 1, subjects)
     test = S.subsample_mask(split["test"], sampling.get("max_test_windows"), seed + 2,
                             subjects)
