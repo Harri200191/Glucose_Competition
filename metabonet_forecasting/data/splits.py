@@ -98,12 +98,46 @@ def leave_one_source_out(store: SequenceStore, cohort: str, val_frac: float = 0.
     return {"train": rest & ~val, "val": val, "test": held}
 
 
+def all_data_split(store: SequenceStore, val_frac: float = 0.06,
+                   seed: int = 0, val_exclude: Sequence[str] = ()
+                   ) -> Dict[str, np.ndarray]:
+    """The FINAL-MODEL split: train on every patient but a small validation slice.
+
+    For the submission model only. Every subject is eligible -- both sides of the
+    official ``is_test`` flag (so the live-leaderboard patients, who are drawn
+    from the official test portion), every cohort, and the internal-holdout IOBP2
+    patients -- except a subject-disjoint ``val_frac`` slice kept back so that
+    ``select_metric`` can still choose between epochs on patients the model has
+    not seen. ``test`` IS that slice, so ``metrics.json`` at the end of the run
+    is an honest held-out score rather than an in-sample one.
+
+    Whole subjects, never anchors: r(CGM_t, CGM_t+5) ~ 0.99, so an anchor-level
+    carve would leak. Nothing here is comparable with any ``official`` run --
+    different training set, different validation set.
+
+    ``val_exclude`` names cohorts whose patients may NOT be drawn into the val
+    slice, so every one of them trains. For the final model that is IOBP2: the
+    annual board's template matches it, it has only 330 patients, and a random
+    12% carve took 38 of them (141,860 anchors) out of training.
+    """
+    subjects = store.anchors["subject"].to_numpy()
+    everyone = np.ones(len(subjects), dtype=bool)
+    pool = everyone.copy()
+    for c in (val_exclude or ()):
+        pool &= store.anchors["cohort"].to_numpy() != store.cohort_code(c)
+    val = _subject_holdout(subjects, pool, val_frac, seed)
+    return {"train": everyone & ~val, "val": val, "test": val.copy()}
+
+
 def make_split(store: SequenceStore, scheme: str, **kw) -> Dict[str, np.ndarray]:
     if scheme == "official":
         split = official_split(store, kw.get("val_frac", 0.12), kw.get("seed", 0))
     elif scheme == "subject_kfold":
         split = subject_kfold(store, kw.get("n_folds", 5), kw.get("fold", 0),
                               kw.get("val_frac", 0.12), kw.get("seed", 0))
+    elif scheme == "all":
+        split = all_data_split(store, kw.get("val_frac", 0.06), kw.get("seed", 0),
+                               kw.get("val_exclude") or ())
     elif scheme == "loso":
         cohort = kw.get("holdout_source")
         if not cohort:

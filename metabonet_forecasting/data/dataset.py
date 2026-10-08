@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+import torch
 from torch.utils.data import DataLoader
 
 from ..common.config import Config, REPO_ROOT
@@ -23,6 +24,34 @@ from .transforms import Standardizer, fit_standardizer
 from .windows import WindowDataset, WindowSpec, collate
 
 LOG = get_console_logger("metabonet")
+
+
+class EpochPermutationSampler(torch.utils.data.Sampler):
+    """The TRAIN order: a permutation seeded by (seed, epoch), startable mid-way.
+
+    Why not ``shuffle=True``: that draws from torch's global RNG, so a run
+    restarted from a mid-epoch checkpoint would see a DIFFERENT order, and
+    skipping the first N batches would repeat some windows and never show
+    others. Here the permutation is a pure function of (seed, epoch), and
+    ``set_epoch(epoch, start)`` resumes at sample ``start`` WITHOUT loading the
+    skipped windows -- which matters when an epoch is 20M windows of 96 hours.
+    Every epoch still sees every training window exactly once.
+    """
+
+    def __init__(self, n: int, seed: int) -> None:
+        self.n, self.seed = int(n), int(seed)
+        self.epoch, self.start = 1, 0
+
+    def set_epoch(self, epoch: int, start: int = 0) -> None:
+        self.epoch, self.start = int(epoch), max(0, int(start))
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed * 1_000_003 + self.epoch)
+        return iter(torch.randperm(self.n, generator=g)[self.start:].tolist())
+
+    def __len__(self) -> int:
+        return max(0, self.n - self.start)
 
 
 @dataclass
@@ -39,9 +68,15 @@ class DataBundle:
         if shuffle is None:
             shuffle = (part == "train")
         num_workers = int(loader_cfg.get("num_workers", 8))
+        # Training shuffles through a seeded, restartable permutation rather than
+        # shuffle=True, so a mid-epoch checkpoint can resume the exact same order.
+        sampler = (EpochPermutationSampler(len(self.datasets[part]),
+                                           int(cfg.get_path("seed", 0)))
+                   if (shuffle and part == "train") else None)
         kwargs = dict(
             batch_size=int(loader_cfg.get("batch_size", 256)),
-            shuffle=shuffle,
+            shuffle=bool(shuffle) and sampler is None,
+            sampler=sampler,
             num_workers=num_workers,
             pin_memory=bool(loader_cfg.get("pin_memory", True)),
             drop_last=(part == "train"),
@@ -85,7 +120,24 @@ def window_spec_from_config(cfg: Config) -> WindowSpec:
         # Empty list = strictly causal = the benchmark. See constants.py.
         future_modalities=list(d.get("future_modalities", []) or []),
         future_steps=d.get("future_steps"),
+        feature_path=_feature_path(d),
+        feature_families=str((d.get("features", {}) or {}).get("families", "all")),
     )
+
+
+def _feature_path(d: Dict) -> Optional[str]:
+    """``data.features`` -> a path, or None when the block is off.
+
+    Both keys must be present in configs/base.yaml; this reads them, it does not
+    invent them.
+    """
+    f = dict(d.get("features", {}) or {})
+    if not bool(f.get("enabled", False)):
+        return None
+    path = f.get("path")
+    if not path:
+        raise ValueError("data.features.enabled is true but data.features.path is unset")
+    return str(path)
 
 
 def _thin(mask: np.ndarray, stride: int) -> np.ndarray:
@@ -162,12 +214,23 @@ def build_data(cfg: Config, standardizer: Optional[Standardizer] = None) -> Data
             seed + 3, subjects)
 
     if standardizer is None:
+        # The feature block is standardised on TRAIN anchors only, like everything
+        # else, so it is loaded here rather than inside the WindowDataset.
+        feats = feat_lut = feat_cols = None
+        if spec.feature_path is not None:
+            root = Path(spec.feature_path)
+            from ..features.spec import select_columns
+            feats = np.load(root / "features.npy", mmap_mode="r")
+            feat_lut = np.load(root / "lookup.npy")
+            feat_cols = select_columns(root, spec.feature_families, spec.context)
+            LOG.info(f"features: {feat_cols.size} of {feats.shape[1]} columns "
+                     f"(families={spec.feature_families}) from {spec.feature_path}")
         standardizer = fit_standardizer(
             store, masks["train"], spec.all_channels(),
             store.horizon_ids(spec.horizons_min),
             target_mode=str(d.get("target_mode", "delta")),
             n_sample_anchors=int(sampling.get("standardizer_sample", 200_000)),
-            seed=seed,
+            seed=seed, feats=feats, feat_lookup=feat_lut, feat_cols=feat_cols,
         )
 
     datasets = {name: WindowDataset(store, m, spec, standardizer)
@@ -193,4 +256,5 @@ def model_input_shapes(bundle: DataBundle) -> Dict[str, object]:
         # is the validity flag the dataset appends.
         "future_steps": future_steps,
         "future_channels": future_channels + 1 if future_channels else 0,
+        "n_extra_features": ds.n_extra_features,
     }
