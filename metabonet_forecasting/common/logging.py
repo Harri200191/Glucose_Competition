@@ -102,6 +102,24 @@ class RunLogger:
         rec.update(fields)
         self._events.write(json.dumps(rec, default=str) + "\n")
 
+    def adopt_existing_csv(self) -> int:
+        """On a RESUMED run: keep train_log.csv's rows and header, append after them.
+
+        Without this the first epoch() of a new process opened the file with
+        "w" and truncated it, so every resume -- epoch-end or mid-epoch -- wiped
+        the curve written before it (the history survived only inside last.pt).
+        Called by the Trainer only when it actually resumed, so a fresh run in
+        a reused directory still starts a clean file. Returns rows kept.
+        """
+        if not self._csv_path.exists() or self._csv_path.stat().st_size == 0:
+            return 0
+        with open(self._csv_path, newline="") as fh:
+            rows = list(csv.reader(fh))
+        if not rows:
+            return 0
+        self._csv_fields = rows[0]
+        return len(rows) - 1
+
     def epoch(self, row: Mapping[str, Any]) -> None:
         """Append one row to train_log.csv, creating the header on first use."""
         row = dict(row)
