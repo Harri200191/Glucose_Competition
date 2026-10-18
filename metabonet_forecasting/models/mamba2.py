@@ -130,10 +130,16 @@ class RMSNormGated(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor, z: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if z is not None:
-            x = x * F.silu(z)
+        # fp32 BEFORE the gate, not after. Under AMP the scan output reaching
+        # this norm can exceed fp16's 65,504 (measured: median 69,460, max 83,160
+        # on hypoglycaemic ctx1152 windows), and gating it in fp16 gives inf; the
+        # rsqrt below then turns inf into inf*0 = NaN, which the next scan carries
+        # to every later step and the cross-attention head to every horizon.
+        # Computing in fp32 is bit-identical when the input is already fp32.
         dtype = x.dtype
         x = x.float()
+        if z is not None:
+            x = x * F.silu(z.float())
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return (x * self.weight.float()).to(dtype)
 
@@ -189,17 +195,28 @@ class Mamba2Block(nn.Module):
         B = B.unsqueeze(2).expand(-1, -1, self.nheads, -1)        # ngroups = 1
         C = C.unsqueeze(2).expand(-1, -1, self.nheads, -1)
 
-        # The scan runs in fp32 even under autocast: it is a cumulative product of
-        # decays over hundreds of steps, and fp16 loses the tail of the state,
-        # which is precisely the long-range information this backbone is here to
-        # test. The projections around it stay in half precision.
+        # The scan AND the gated norm after it run in fp32 even under autocast.
+        # The scan is a cumulative product of decays over hundreds of steps, and
+        # fp16 loses the tail of the state -- the long-range information this
+        # backbone is here to test. The norm is in the same block because the
+        # scan output is UNBOUNDED: the norm makes the loss nearly blind to its
+        # scale, so the weights that set it grow unchecked through training, and
+        # once it passes 65,504 a `.to(fp16)` cast here turns it into inf. That
+        # was every Mamba-2 / MambaFormer "explosion" in this repo: 16 of 73 mamba2
+        # and 8 of 14 mambaformer runs, 0 of 296 other backbones. Triggered by
+        # hypoglycaemic stretches deep in long windows (96% of NaN anchors had a
+        # reading <=54 mg/dL; 24/24 overflow at ctx1152 vs 7/24 at ctx288), so
+        # the skipped batches were exactly the hypo-heavy, IOBP2-heavy ones.
+        # Reproduced on CPU: 0/24 bad anchors finite before this change, 24/24
+        # after, matching fp32 to 0.025 mg/dL. The norm output is bounded
+        # (~|68|), so handing it back to fp16 for out_proj is safe.
         with torch.amp.autocast(device_type=x.device.type, enabled=False):
             y, _ = ssd_chunked((x * dt.unsqueeze(-1)).float(),
                                (A.reshape(1, 1, -1) * dt).float(),
                                B.float(), C.float(), self.chunk_size)
-        y = y.to(x.dtype) + x * self.D.reshape(1, 1, -1, 1)
-        y = y.reshape(b, l, self.d_inner)
-        return self.out_proj(self.norm(y, z))
+            y = y + x.float() * self.D.float().reshape(1, 1, -1, 1)
+            y = self.norm(y.reshape(b, l, self.d_inner), z)
+        return self.out_proj(y)
 
 
 class Mamba2Layer(nn.Module):

@@ -184,6 +184,59 @@ class TiRexBackend(Backend):
         return np.asarray(mean.float().cpu())
 
 
+class TimestralBackend(Backend):
+    """Timestral (Mistral, Oct 2026): causal patch transformer, 21 quantiles.
+
+    Four sizes (5M / 28M / 123M / 209M), one architecture: 32-step patches, a
+    time-attention stack with a ``time_variate`` layer every fourth block, which
+    is what lets a known covariate's future reach the target -- every published
+    checkpoint reports ``supports_known_covariates``. Verified against
+    mistralai/timestral@a534bdb:
+
+      forecast(context [B, T], prediction_length=H,
+               past_covariates=[B, C, T], known_covariates=[B, C, T + H])
+        -> Forecast.quantiles [B, V, H, 21]
+
+    Covariates are CHANNEL-SECOND, and known covariates carry context and
+    horizon in ONE row of length T + H (the opposite of TimesFM 3.0's
+    per-series list). NaN in the target is native missingness -- the model
+    masks it, so nothing is forward-filled here.
+
+    The point forecast is the MEDIAN, not a mean: quantiles commute with the
+    log, so this is exactly the predictive log-median that zone A is centred on
+    (up to the -0.020411 constant, which no zero-shot arm gets).
+
+    The 288-step context is nine whole patches, so no left padding enters; the
+    24-step horizon is one patch, so decoding is a single block and the
+    block-autoregressive median feedback never runs. ``symmetric_averaging``
+    (on by default upstream, doubles the cost) is kept on: it is the published
+    inference recipe, and the comparison is against the model as released.
+    """
+
+    supports_covariates = True
+
+    def __init__(self, model_id: str, device: str) -> None:
+        from timestral import TimestralForecaster
+        self.name = model_id
+        self.model = TimestralForecaster.from_pretrained(model_id, device=device)
+
+    def predict(self, context: np.ndarray, past_cov=None,
+                fut_cov=None) -> np.ndarray:
+        past = known = None
+        if past_cov:
+            both = [k for k in past_cov if fut_cov and k in fut_cov]
+            only = [k for k in past_cov if k not in set(both)]
+            if both:
+                known = np.stack([np.concatenate([past_cov[k], fut_cov[k]], axis=1)
+                                  for k in both], axis=1).astype(np.float32)
+            if only:
+                past = np.stack([past_cov[k] for k in only],
+                                axis=1).astype(np.float32)
+        fc = self.model.forecast(context, prediction_length=PRED_STEPS,
+                                 past_covariates=past, known_covariates=known)
+        return fc.median[:, 0].float().cpu().numpy()
+
+
 BACKENDS = {
     "chronos-bolt":      (ChronosBackend, "amazon/chronos-bolt-base"),
     "chronos-bolt-small": (ChronosBackend, "amazon/chronos-bolt-small"),
@@ -191,6 +244,10 @@ BACKENDS = {
     "timesfm":           (TimesFMBackend, "google/timesfm-2.5-200m-pytorch"),
     "timesfm3":          (TimesFM3Backend, "google/timesfm-3.0-pytorch"),
     "tirex":             (TiRexBackend, "NX-AI/TiRex"),
+    "timestral":         (TimestralBackend, "mistralai/Timestral-209M"),
+    "timestral-123m":    (TimestralBackend, "mistralai/Timestral-123M"),
+    "timestral-28m":     (TimestralBackend, "mistralai/Timestral-28M"),
+    "timestral-5m":      (TimestralBackend, "mistralai/Timestral-5M"),
 }
 
 
@@ -225,12 +282,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--stride", type=int, default=1,
                     help="use every k-th test anchor (cheap ranking pass)")
-    ap.add_argument("--covariates", default=None, choices=[None, "insulin"],
-                    help="feed insulin (basal+bolus) as past + future-known "
-                         "covariates; only for backends that support them. "
-                         "Future values never cross the anchor's segment end. "
-                         "This is the intervention-conditioned condition — "
-                         "label the run _futins like the trained ones.")
+    ap.add_argument("--covariates", default=None,
+                    choices=[None, "insulin", "insulin_past"],
+                    help="insulin: feed insulin (basal+bolus) as past + "
+                         "future-known covariates; only for backends that "
+                         "support them. Future values never cross the anchor's "
+                         "segment end. This is the intervention-conditioned "
+                         "condition — label the run _futins like the trained "
+                         "ones. insulin_past: the same channels over the "
+                         "context only, which is strictly causal.")
     ap.add_argument("--limit", type=int, default=None,
                     help="hard cap on the number of test anchors")
     ap.add_argument("--split", default="test",
@@ -283,7 +343,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     cov_names: List[str] = []
     seg_end = None
-    if a.covariates == "insulin":
+    use_future = a.covariates == "insulin"
+    if a.covariates in ("insulin", "insulin_past"):
         if not backend.supports_covariates:
             raise SystemExit(f"backend {a.model} does not support covariates")
         cov_names = ["ins_basal", "ins_bolus"]
@@ -291,8 +352,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         seg_lookup = store.segments.set_index("seg")["end"]
         seg_end = seg_lookup.loc[
             store.anchors["seg"].to_numpy()[anchor_ids]].to_numpy()
-        log.info(f"covariates: {cov_names} (past {context} steps + future "
-                 f"{PRED_STEPS} steps, segment-capped)")
+        log.info(f"covariates: {cov_names} (past {context} steps"
+                 + (f" + future {PRED_STEPS} steps, segment-capped)"
+                    if use_future else ", no future)"))
 
     preds = np.full((len(anchor_ids), len(horizons)), np.nan, dtype=np.float32)
     t0 = time.time()
@@ -304,12 +366,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for r in rows[lo:hi]])
         past_cov = fut_cov = None
         if cov_names:
-            past_cov, fut_cov = {}, {}
+            past_cov = {}
+            fut_cov = {} if use_future else None
             for n in cov_names:
                 cid = cov_ids[n]
                 past = np.stack([
                     np.asarray(store.channels[r - context + 1: r + 1, cid],
                                dtype=np.float32) for r in rows[lo:hi]])
+                past_cov[n] = np.nan_to_num(past)
+                if not use_future:
+                    continue
                 fut = np.zeros((hi - lo, PRED_STEPS), dtype=np.float32)
                 for i, r in enumerate(rows[lo:hi]):
                     usable = int(min(PRED_STEPS, max(seg_end[lo + i] - r - 1, 0)))
@@ -317,7 +383,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         fut[i, :usable] = np.nan_to_num(np.asarray(
                             store.channels[r + 1: r + 1 + usable, cid],
                             dtype=np.float32))
-                past_cov[n] = np.nan_to_num(past)
                 fut_cov[n] = fut
         path = backend.predict(block, past_cov, fut_cov)    # [b, PRED_STEPS]
         preds[lo:hi] = path[:, [s - 1 for s in horizon_steps]]
@@ -344,7 +409,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log.write_json("manifest.json", {
         "run_name": run_name, "zero_shot": True, "backend": backend.name,
         "stride": a.stride, "limit": a.limit, "context": context,
-        "split": a.split,
+        "split": a.split, "covariates": a.covariates,
         "config": cfg.to_dict(), "provenance": provenance(),
     })
 

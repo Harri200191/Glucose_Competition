@@ -179,7 +179,7 @@ class TFTForecaster(ForecastModel):
         h = self.position_wise(h)
         future = (self.future_encoder(batch["x_future"])
                   if self.future_encoder is not None else None)
-        point, quantiles = self.head(h, future)
+        point, quantiles, _ = self.head(h, future)
         return ForecastOutput(pred_norm=point, quantiles=quantiles,
                               aux={"variable_weights": self.last_variable_weights})
 

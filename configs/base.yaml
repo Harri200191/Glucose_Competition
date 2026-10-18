@@ -51,9 +51,12 @@ data:
   future_steps: null           # null = out to the longest horizon
 
   split:
-    scheme: official           # official | subject_kfold | loso
+    scheme: official           # official | subject_kfold | loso | all
+                               # all = FINAL MODEL: train on every patient but a
+                               # subject-disjoint val_frac slice (val == test).
     val_frac: 0.12
     seed: 0
+    val_exclude: []            # scheme=all only: cohorts never drawn into val
 
   # Second evaluation set. The annual competition holdout is not a random slice
   # of this corpus: all 90 of its patients are on a Dexcom G6 with the iLet
@@ -84,6 +87,21 @@ data:
     refresh: false               # true = re-draw and overwrite the frozen set
     seed: 0
 
+  # Engineered per-anchor features, built by
+  # `python -m metabonet_forecasting.features.build`. OFF by default: this repo's
+  # own Experiment B measured the cost of deleting all ELEVEN engineered
+  # pharmacology channels at -0.37 / -0.26 / -0.22 DTS-A@60 for Mamba-2 / TCN /
+  # PatchTST against seed noise of 0.34 / 0.18 / 0.06, so 0 -> 11 features bought
+  # about 0.3 points, at the noise floor. A sequence model over the raw lattice
+  # computes rolling statistics in its own hidden state; a tabular model cannot,
+  # which is why a GBM competitor needs hundreds of them and this does not. On by
+  # config only, as a falsification test.
+  features:
+    enabled: false
+    path: null               # a directory written by features.build
+    families: all            # all | tier1 | comma-separated family names.
+                             # Selects COLUMNS from the built matrix, so a
+                             # leave-one-family-out ablation needs no rebuild.
   sampling:
     train_stride: 1            # extra thinning on top of the store's anchor stride
     max_train_windows: 2000000
@@ -103,6 +121,12 @@ data:
 model:
   d_model: 128
   d_static: 32
+  # Width the engineered feature block is projected to before it joins the static
+  # conditioning vector. 64 against d_static 32: the block is hundreds of columns
+  # wide, so squeezing it to 32 would bottleneck the very thing under test, while
+  # letting it dwarf d_model would make the arm a capacity change too.
+  d_feat: 64
+  feat_hidden: null          # null = max(2*d_feat, 128)
   d_time: 16
   static_emb_dim: 8
   encoder:
@@ -132,8 +156,43 @@ model:
   backbone:
     name: tcn
   head:
+    name: pooled             # pooled | horizon_cross
     pooling: last_mean
     dropout: 0.1
+    quantiles: null          # e.g. [0.05,0.1,0.25,0.5,0.75,0.9,0.95]; null = point only
+    chain: none              # none|causal|full|cumulative|causal_cum|value|dist
+    # The PREDICTIVE LAW the head emits, as distinct from `chain: dist` above,
+    # which is about what passes between horizons.
+    #
+    # `student_t` makes the head emit (decision, mu, log sigma, log nu) per
+    # horizon instead of a quantile ladder, which is what lets
+    # training.loss.name=zone_t optimise the EXACT expected zone A: the metric is
+    # a 0/1 indicator with no gradient, but its expectation under a t is a closed
+    # form. The t is not arbitrary -- fitted to this project's own pooled
+    # log-residual it reproduces the observed zone-A rate to 0.27-1.17 points at
+    # every horizon, where a Gaussian is wrong by up to 8.71, fourteen times the
+    # run-to-run noise floor (scripts/analysis/_objective_probe.py).
+    #
+    # k > 1 is the mixture, and it is the defensible form of "separate models for
+    # hypo / hyper / mid": components specialise on a shared backbone without any
+    # of them ever losing the middle band, which is 71% of anchors and 63% of all
+    # lost points. It also breaks the symmetric-unimodal result that makes the
+    # zone-A-optimal point just "median + a constant" -- a multimodal law is the
+    # one case where a per-anchor decision can beat a global multiplier.
+    law:
+      name: none             # none | student_t
+      k: 1                   # mixture components
+      sigma_init: 0.4        # measured sigma/target_scale: 0.353/0.378/0.394/0.415
+      nu_init: 3.0           # measured fitted nu: 2.50/2.89/3.24/3.67 by horizon
+      nu_min: 2.05           # below 2 the variance is undefined
+      nu_max: 30.0           # a t at nu=30 is a Gaussian; no reason to go there
+      mu_spread: 0.5         # k>1: component offsets, in band half-widths. Symmetric
+                             # about 0, so the mixture median is still 0 at init
+                             # (persistence) while the components are distinct --
+                             # identical components would get identical gradients
+                             # forever.
+      quad_nodes: 32         # Gauss-Legendre nodes for the t CDF. 32 gives 2.0e-8
+                             # relative error vs scipy; see common/studentt.py.
 
 training:
   device: cuda
@@ -144,10 +203,53 @@ training:
   grad_clip: 1.0
   accumulate_grad_batches: 1
   amp: true
-  patience: 5                  # epochs without a *significant* val-RMSE gain before stopping
-  min_delta: 0.0               # mg/dL of val RMSE that counts as a gain; 0.0 = any
-                               # improvement resets patience. Set ~0.02 to stop once
-                               # epochs stop buying anything measurable.
+  patience: 5                  # epochs without a *significant* gain before stopping
+  # What best.pt is selected on. val_rmse is what every historical run used, but
+  # it is the WRONG criterion for an arm whose loss deliberately trades RMSE for
+  # zone A, and until this key existed every such experiment was confounded by it.
+  # Validation zone A is computed and written to train_log.csv either way.
+  # Continue from last.pt when the run directory already has one. Default ON:
+  # what this guards against is a multi-day run being killed, and last.pt carries
+  # the optimiser, the LR schedule position, the AMP scaler and the early-stopping
+  # counters -- restarting from best.pt alone would reset the cosine schedule to
+  # step 0 and lose the optimiser moments, which is a different experiment rather
+  # than a continuation. A fingerprint over the data/model/loss config is stored
+  # with it, and a mismatch raises instead of silently continuing another run.
+  resume: true
+  # Resume points INSIDE an epoch, as fractions of it: e.g. [0.25, 0.5, 0.75]
+  # rewrites last.pt (exactly resumable -- the train order is a seeded
+  # permutation) and keeps the weights as ckpt/epEE_qK.pt, plus ckpt/epEE_end.pt.
+  # [] = epoch-end only, as every run before 2026-09-24.
+  checkpoint_fractions: []
+  # Stop the run once this many batches in ONE epoch had a non-finite loss.
+  # Skipped batches are not random: in the Mamba runs they were the hypo-heavy
+  # windows (7-23% of batches), so skipping silently skews what is learned.
+  # null = old behaviour (skip and count forever).
+  max_nonfinite_batches: null
+  select_metric: val_rmse      # val_rmse | val_zone_a
+  min_delta: 0.0               # a gain that counts, IN THE UNITS OF select_metric:
+                               # mg/dL of val RMSE, or percentage points of zone A.
+                               # 0.0 = any improvement resets patience. NOTE 0.02 is
+                               # a sensible stinginess in mg/dL and an absurd one in
+                               # zone-A points (3% of the 0.6 noise floor);
+                               # EXPERIMENT_LEDGER.md sec.4 traces a +1.68 result
+                               # that evaporated to +0.25 to this setting stopping
+                               # two IDENTICAL configs at 7 and 15 epochs.
+  # Exponential moving average of the weights. The remaining error here is SPREAD,
+  # not bias -- at h=120 the sd of log(pred/true) is 0.2068 against a pass window of
+  # +/-0.2027, so one sd IS the pass mark. Ensembling is the one intervention that
+  # reliably reduces spread (+0.5, reproduced every time) and weight averaging is
+  # its free approximation. Conditions favour it: several shipped runs never
+  # converged (all four c96 runs ended their final epoch on *best*).
+  ema:
+    enabled: false
+    decay: 0.999               # per OPTIMISER STEP; at ~1,245 steps/epoch on the
+                               # mini-corpus that is roughly a 0.8-epoch horizon
+    start_epoch: 1
+    eval_both: true            # score raw and averaged each epoch and checkpoint
+                               # the better -- costs ~6% wall and cannot lose.
+                               # false trusts the average instead (one eval, not
+                               # two); it never means "average, then ignore it".
   warmup_steps: 500
   min_lr_frac: 0.05
   deterministic: false
@@ -159,5 +261,62 @@ training:
     # 120 min has several times the headroom (~72%), so an unweighted loss
     # under-invests in the horizon that decides the result. null = equal.
     horizon_weights: null      # e.g. [1.0, 1.0, 1.5, 2.0]
+    # huber | mse | mae | quantile | hybrid | welsch | tukey | zone_t
+    #
+    # Zone A is BOUNDED: once a prediction leaves the band, being further out
+    # costs the metric nothing, but a squared or linear loss keeps paying
+    # attention in proportion to the error. Share of gradient landing on anchors
+    # already outside zone A at h=120 (scripts/analysis/_objective_probe.py):
+    #
+    #   squared error 65.6%   huber delta=1  62.4%   huber delta=0.5  51.2%
+    #   welsch 1.0R   33.5%   tukey 2.0R     24.3%
+    #
+    # `ox_half` (delta 0.5) is the only loss change that ever beat the noise floor
+    # (+0.28) and it sits in the MIDDLE of that ladder, which is why the
+    # redescending losses exist. The objection that a bounded loss abandons hard
+    # cases is answered by the distances: at h=120, 46% of failing anchors are
+    # within half a band-width of passing and only 8.4% are beyond two.
     name: huber
     delta: 1.0
+    alpha: 1.0                 # quantile/hybrid: weight on the pinball term.
+                               # Measured: 1.0 vs 0.5 is -0.031, i.e. nothing.
+    quantiles: [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+    move_weight: 0.0           # upweight fast-moving anchors. MEASURED NEGATIVE:
+                               # -0.71 at 0.5, -1.83 at 1.5. It buys the 25% tails
+                               # by selling the 42% flat middle. Closed.
+    # Zone A is |log(p/y) - CENTRE| <= HALFWIDTH with CENTRE = -0.020411: the band
+    # is NOT centred on zero (you may be 22.3% low but only 18.2% high). For any
+    # symmetric unimodal predictive law the zone-A-optimal point is therefore the
+    # conditional log-median plus CENTRE, independent of the spread -- confirmed to
+    # 0.001-0.004 in multiplier units against a grid search. band_offset puts that
+    # constant into training rather than correcting for it afterwards, which
+    # matters because the post-hoc fit does NOT transfer: +0.225 on test, -0.106 on
+    # the 89 unseen holdout patients, where the model's bias flips sign.
+    band_offset: false
+    bandwidth: 1.0             # welsch/tukey: bandwidth as a MULTIPLE of the
+                               # zone-A half-width in model space, so the knob
+                               # means the same thing at every horizon.
+    # --- training.loss.name=zone_t only ------------------------------------
+    nll_weight: 1.0            # LOAD-BEARING. The band term alone drives sigma->0
+                               # where the model is right and sigma->|residual|
+                               # where it is wrong, destroying the quantile ladder
+                               # submission/decide.py consumes. 0 = diagnostic only.
+    zone_obj: prob             # prob (1-P) | logprob (-log P). NOT logprob by
+                               # default: -log P grows like nu*log|e| so its
+                               # gradient decays only as 1/|e| and it spends 59.4%
+                               # of its gradient on already-lost anchors -- worse
+                               # than plain Huber's 51.2%. 1-P spends 36.3%.
+    zone_obj_weight: 1.0
+    point_weight: 0.0          # optional Huber on the decision output
+    sharpness_weight: 0.0      # penalty on log sigma: the explicit
+                               # sharpness-vs-calibration trade, with one
+                               # interpretable coefficient instead of hoping
+                               # weight decay does it indirectly.
+    quad_nodes: 32
+    # --- the sigmoid stand-in, superseded by zone_t ------------------------
+    zone_weight: 0.0           # blend in sigmoid((R-|resid|)/tau). MEASURED AT
+                               # NOISE: +0.01 / +0.10 / -0.09 over a tau ladder,
+                               # flat rather than monotone, which is also the
+                               # answer about a policy gradient -- it reaches the
+                               # same objective the surrogate already reaches.
+    zone_tau: 0.15

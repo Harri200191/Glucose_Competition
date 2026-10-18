@@ -14,10 +14,148 @@ way.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+import math
+
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+
+from ..common import studentt as _t
+
+
+class StudentTLaw(nn.Module):
+    """Turns a head's raw output into a Student-t predictive law.
+
+    WHY A LAW AT ALL. DTS zone A is a 0/1 indicator and has no gradient, but its
+    *expectation under a predictive law* does, and for a t it is closed form (see
+    ``common/studentt.py``, and ``training/losses.py::ZoneStudentT``). That is the
+    only route to optimising the metric itself rather than a stand-in for it.
+
+    WHY A t. Fitted to this project's own pooled log-residual, a t reproduces the
+    observed zone-A rate to 0.27-1.17 points at every horizon where a Gaussian is
+    wrong by up to 8.71 -- fourteen times the noise floor. Fitted nu runs
+    2.50/2.89/3.24/3.67 for 30/60/90/120 min, hence ``nu_init=3``.
+
+    WHY A DECISION OUTPUT SEPARATE FROM THE LAW. For any symmetric unimodal law
+    the zone-A-optimal point is the conditional median plus a constant, so tying
+    the decision to the law's location would make the two fight (that is the
+    documented tension in ``HybridLoss``). Emitting them separately lets the
+    likelihood term own the law and the band term own the decision, and it is what
+    makes a mixture worth anything: for a MULTIMODAL law the optimal point is not
+    the median plus anything, which is the one case where a per-anchor decision
+    can beat a global multiplier.
+
+    WHY K > 1 IS THE MIXTURE-OF-EXPERTS VERSION. Separate models per glycaemic
+    regime route on a variable that barely separates them (an oracle picking the
+    best of five models per regime gains +0.012/+0.025 against a 0.6 noise floor).
+    A mixture on a shared backbone specialises in the same spirit without any
+    component ever losing the middle band -- which is 71% of anchors and 63% of
+    all lost points.
+
+    PERSISTENCE AT INIT IS PRESERVED. Every constant is folded into the transform
+    rather than into a bias, so the producing ``Linear`` stays zero-init on both
+    weight and bias and a fresh model still predicts "no change". For K > 1 the
+    component offsets are symmetric about zero, so the mixture's median is still
+    exactly zero while the components are distinct -- without that symmetry
+    breaking, identical components receive identical gradients forever.
+    """
+
+    def __init__(self, n_horizons: int, quantiles: Optional[Sequence[float]] = None,
+                 k: int = 1, sigma_init: float = 0.4, nu_init: float = 3.0,
+                 nu_min: float = 2.05, nu_max: float = 30.0,
+                 mu_spread: float = 0.5, quad_nodes: int = 32) -> None:
+        super().__init__()
+        if k < 1:
+            raise ValueError(f"model.head.law.k must be >= 1, got {k}")
+        if not nu_min > 2.0:
+            # Below 2 the variance is undefined and sigma stops being a scale the
+            # band probability can be reasoned about.
+            raise ValueError(f"model.head.law.nu_min must exceed 2.0, got {nu_min}")
+        self.n_horizons = n_horizons
+        self.k = int(k)
+        self.quantiles = list(quantiles) if quantiles else []
+        self.nu_min, self.nu_max = float(nu_min), float(nu_max)
+        self.log_sigma_init = math.log(float(sigma_init))
+        # softplus(nu_bias) + nu_min == nu_init exactly, so a zero raw output
+        # gives nu_init and the zero-init property survives.
+        self.nu_bias = math.log(math.expm1(float(nu_init) - float(nu_min)))
+        self.register_buffer(
+            "mu_bias",
+            torch.zeros(self.k) if self.k == 1
+            else torch.linspace(-1.0, 1.0, self.k) * float(mu_spread))
+        x, w = _t.quadrature(int(quad_nodes), dtype=torch.float32)
+        self.register_buffer("qx", x)
+        self.register_buffer("qw", w)
+
+    @property
+    def n_raw(self) -> int:
+        """Outputs per horizon: the decision, then mu/log-sigma/log-nu per
+        component, then the mixture logits when there is more than one."""
+        return 1 + 3 * self.k + (self.k if self.k > 1 else 0)
+
+    def forward(self, raw: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+                                                  Dict[str, torch.Tensor]]:
+        """``[B, H, n_raw]`` -> (point ``[B,H]``, quantiles ``[B,H,Q]``, aux)."""
+        k = self.k
+        point = raw[..., 0]
+        mu = raw[..., 1:1 + k] + self.mu_bias
+        sigma = torch.exp(raw[..., 1 + k:1 + 2 * k] + self.log_sigma_init)
+        nu = (self.nu_min + torch.nn.functional.softplus(
+            raw[..., 1 + 2 * k:1 + 3 * k] + self.nu_bias)).clamp(max=self.nu_max)
+        log_pi = (torch.zeros_like(mu) if k == 1
+                  else torch.log_softmax(raw[..., 1 + 3 * k:1 + 4 * k], dim=-1))
+        aux = {"dist_point": point, "dist_mu": mu, "dist_sigma": sigma,
+               "dist_nu": nu, "dist_log_pi": log_pi}
+        return point, self.ladder(aux), aux
+
+    def ladder(self, aux: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """The reported quantile columns, from the analytic inverse CDF.
+
+        Built only in eval(): the loss consumes ``aux`` directly, so inverting the
+        CDF on every training step would be pure waste. ``predict`` and
+        ``evaluate_loader`` both call ``.eval()`` first, which is exactly when the
+        columns are needed.
+
+        ``cummax`` afterwards because the ladder is monotone analytically but the
+        bisection's ~1e-8 residual could still invert two adjacent levels, and
+        ``scripts/analysis/_calibration.py`` would report nonsense if it did.
+        """
+        if self.training or not self.quantiles:
+            return None
+        mu, sigma, nu = aux["dist_mu"], aux["dist_sigma"], aux["dist_nu"]
+        cols = []
+        for lv in self.quantiles:
+            if self.k == 1:
+                z = _t.icdf(torch.full_like(nu[..., 0], float(lv)), nu[..., 0],
+                            self.qx, self.qw)
+                cols.append(mu[..., 0] + sigma[..., 0] * z)
+            else:
+                cols.append(_t.mixture_icdf(float(lv), aux["dist_log_pi"], mu,
+                                            sigma, nu, self.qx, self.qw))
+        return torch.cummax(torch.stack(cols, dim=-1), dim=-1).values
+
+
+def build_law(head_cfg: dict, n_horizons: int) -> Optional[StudentTLaw]:
+    """``model.head.law`` -> a law, or None for the ordinary quantile ladder.
+
+    Named ``law`` and not ``dist`` because ``model.head.chain='dist'`` already
+    means something else in this file.
+    """
+    cfg = dict(head_cfg.get("law") or {})
+    name = str(cfg.get("name") or "none").lower()
+    if name in ("none", "null", ""):
+        return None
+    if name != "student_t":
+        raise ValueError(f"model.head.law.name must be none|student_t, got {name!r}")
+    return StudentTLaw(
+        n_horizons, quantiles=head_cfg.get("quantiles"),
+        k=int(cfg.get("k", 1)), sigma_init=float(cfg.get("sigma_init", 0.4)),
+        nu_init=float(cfg.get("nu_init", 3.0)),
+        nu_min=float(cfg.get("nu_min", 2.05)),
+        nu_max=float(cfg.get("nu_max", 30.0)),
+        mu_spread=float(cfg.get("mu_spread", 0.5)),
+        quad_nodes=int(cfg.get("quad_nodes", 32)))
 
 
 class MultiHorizonHead(nn.Module):
@@ -26,7 +164,7 @@ class MultiHorizonHead(nn.Module):
     def __init__(self, d_model: int, n_horizons: int, hidden: Optional[int] = None,
                  pooling: str = "last_mean", dropout: float = 0.0,
                  quantiles: Optional[Sequence[float]] = None,
-                 d_extra: int = 0) -> None:
+                 d_extra: int = 0, law: Optional["StudentTLaw"] = None) -> None:
         super().__init__()
         if pooling not in ("last", "mean", "last_mean"):
             raise ValueError(f"unknown pooling {pooling!r}")
@@ -40,7 +178,9 @@ class MultiHorizonHead(nn.Module):
         self.d_extra = d_extra
         in_dim = d_model * (2 if pooling == "last_mean" else 1) + d_extra
         hidden = hidden or max(d_model, 64)
-        n_out = n_horizons * (1 + len(self.quantiles))
+        self.law = law
+        n_out = n_horizons * (law.n_raw if law is not None
+                              else 1 + len(self.quantiles))
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(dropout),
@@ -65,11 +205,13 @@ class MultiHorizonHead(nn.Module):
                 raise ValueError("head was built with d_extra but got no extra input")
             pooled = torch.cat([pooled, extra], dim=-1)
         out = self.net(pooled)
+        if self.law is not None:
+            return self.law(out.reshape(-1, self.n_horizons, self.law.n_raw))
         point = out[:, :self.n_horizons]
         if not self.quantiles:
-            return point, None
+            return point, None, {}
         q = out[:, self.n_horizons:].reshape(-1, self.n_horizons, len(self.quantiles))
-        return point, _monotone_quantiles(point, q, len(self.quantiles))
+        return point, _monotone_quantiles(point, q, len(self.quantiles)), {}
 
 
 def _monotone_quantiles(point: torch.Tensor, raw: torch.Tensor,
@@ -158,8 +300,9 @@ class HorizonCrossHead(nn.Module):
                  future_steps: int = 0, future_channels: int = 0,
                  n_heads: int = 4, n_layers: int = 2, dropout: float = 0.0,
                  quantiles: Optional[Sequence[float]] = None,
-                 chain: str = "none") -> None:
+                 chain: str = "none", law: Optional["StudentTLaw"] = None) -> None:
         super().__init__()
+        self.law = law
         self.chain = str(chain)
         if self.chain not in self.CHAIN_MODES:
             raise ValueError(f"head.chain must be one of {self.CHAIN_MODES}, "
@@ -172,12 +315,27 @@ class HorizonCrossHead(nn.Module):
         self.chain_feeds = self.chain_value or self.chain_dist
         self.n_horizons = n_horizons
         self.quantiles = list(quantiles) if quantiles else []
-        if self.chain_dist and not self.quantiles:
+        if self.chain_dist and not (self.quantiles or law is not None):
             raise ValueError(
                 "head.chain='dist' passes the predictive distribution between "
-                "horizons, so the head must emit quantiles. Set "
-                "model.head.quantiles (and a quantile-aware loss), or use "
-                "chain='value' to pass the point forecast alone.")
+                "horizons, so the head must emit quantiles or a law. Set "
+                "model.head.quantiles (and a quantile-aware loss), set "
+                "model.head.law.name=student_t, or use chain='value' to pass the "
+                "point forecast alone.")
+        # A law's parameters do not compose the way a point forecast does, so
+        # rather than approximate, say so. cumsum over a distribution's location
+        # would need the scale composed too, and "the sum of four log increments"
+        # has no counterpart for nu or for a mixture weight.
+        if law is not None and self.chain_cumulative:
+            raise ValueError(
+                f"head.chain={chain!r} cumulatively sums the point forecast, which "
+                "has no meaning for a predictive law (sigma and nu do not add). "
+                "Use chain=none, causal, full or dist with model.head.law.")
+        if law is not None and self.chain_value and law.k > 1:
+            raise ValueError(
+                "head.chain='value' feeds forward output slot 0, which is the "
+                "decision and not the median of a K>1 mixture. Use chain='dist', "
+                "which passes the whole parameter vector.")
         self.future_steps = future_steps
         self.queries = nn.Parameter(torch.randn(n_horizons, d_model) * 0.02)
         self.anchor_proj = nn.Linear(d_model, d_model)
@@ -215,12 +373,14 @@ class HorizonCrossHead(nn.Module):
             # dist hands over the point AND the recentred ladder; value only
             # the point. Zero-init either way, so both start numerically
             # identical to chain=none and have to earn their way in.
-            self.chain_in = 1 + (len(self.quantiles) if self.chain_dist else 0)
+            self.chain_in = (law.n_raw if (law is not None and self.chain_dist)
+                             else 1 + (len(self.quantiles) if self.chain_dist else 0))
             self.value_proj = nn.Linear(self.chain_in, d_model)
             nn.init.zeros_(self.value_proj.weight)
             nn.init.zeros_(self.value_proj.bias)
         self.out_norm = nn.LayerNorm(d_model)
-        self.out = nn.Linear(d_model, 1 + len(self.quantiles))
+        self.out = nn.Linear(d_model, law.n_raw if law is not None
+                             else 1 + len(self.quantiles))
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
 
@@ -259,7 +419,12 @@ class HorizonCrossHead(nn.Module):
                 qk = self.out_norm(q[:, k] + self.value_proj(prev))
                 ok = self.out(qk)                            # [B, 1+Q]
                 steps.append(ok)
-                if self.chain_dist:
+                if self.law is not None:
+                    # The whole raw parameter vector goes forward -- strictly more
+                    # information than the ladder, and no CDF inversion inside a
+                    # loop that runs once per horizon per step.
+                    prev = ok
+                elif self.chain_dist:
                     # The same offsets _monotone_quantiles will build, so what
                     # goes forward is the ladder that is actually reported --
                     # not a second, differently-shaped estimate of it.
@@ -272,10 +437,12 @@ class HorizonCrossHead(nn.Module):
             out = torch.stack(steps, dim=1)                  # [B, H, 1+Q]
         else:
             out = self.out(self.out_norm(q))                 # [B, H, 1+Q]
+        if self.law is not None:
+            return self.law(out)
         point = out[..., 0]
         if self.chain_cumulative:
             point = torch.cumsum(point, dim=1)
         if not self.quantiles:
-            return point, None
+            return point, None, {}
         return point, _monotone_quantiles(point, out[..., 1:],
-                                          len(self.quantiles))
+                                          len(self.quantiles)), {}

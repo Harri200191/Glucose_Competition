@@ -31,6 +31,17 @@ import torch.nn as nn
 class ForecastOutput:
     pred_norm: torch.Tensor                      # [B, H] point forecast, model space
     quantiles: Optional[torch.Tensor] = None     # [B, H, Q] if a quantile head is on
+    # Anything else the model wants to expose. Two conventions live here:
+    #
+    #   interpretation   free-form, read by analysis scripts only. tft.py's
+    #                    "variable_weights" is the example.
+    #   the PREDICTIVE LAW   a head with model.head.law set must publish
+    #                    dist_point [B,H] and dist_mu / dist_sigma / dist_nu /
+    #                    dist_log_pi [B,H,K]. training/losses.py::ZoneStudentT
+    #                    consumes exactly those keys, and losses.loss_inputs
+    #                    decides what a criterion is handed from its own
+    #                    input_kind -- so the training loop still never branches
+    #                    on which architecture produced the output.
     aux: Dict[str, torch.Tensor] = field(default_factory=dict)
 
 

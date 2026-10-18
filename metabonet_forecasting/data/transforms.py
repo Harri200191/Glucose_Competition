@@ -63,10 +63,16 @@ class Standardizer:
     def __init__(self, channels: Dict[str, ChannelStat],
                  static_center: List[float], static_scale: List[float],
                  target_center: List[float], target_scale: List[float],
-                 target_mode: str, horizons_min: List[int]) -> None:
+                 target_mode: str, horizons_min: List[int],
+                 feat_center: Optional[List[float]] = None,
+                 feat_scale: Optional[List[float]] = None) -> None:
         self.channels = channels
         self.static_center = np.asarray(static_center, dtype=np.float32)
         self.static_scale = np.asarray(static_scale, dtype=np.float32)
+        # Engineered per-anchor features, when data.features is on. Optional and
+        # last in the signature so every existing standardizer.json still loads.
+        self.feat_center = np.asarray(feat_center or [], dtype=np.float32)
+        self.feat_scale = np.asarray(feat_scale or [], dtype=np.float32)
         self.target_center = np.asarray(target_center, dtype=np.float32)
         self.target_scale = np.asarray(target_scale, dtype=np.float32)
         self.target_mode = target_mode
@@ -93,6 +99,23 @@ class Standardizer:
             else:
                 out[:, j] = (col - st.center) / max(st.scale, 1e-6)
         return out
+
+    def transform_features(self, f: np.ndarray) -> np.ndarray:
+        """Engineered per-anchor features -> model space.
+
+        Deliberately the same three guards as ``transform_statics``, and for a
+        sharper reason: with several hundred generated columns you WILL have
+        degenerate ones (a family whose modality is absent for a whole cohort is
+        constant, so its IQR is 0) and NaN ones. The scale floor keeps a constant
+        column at 0 instead of dividing by zero, nan_to_num keeps an absent
+        modality from poisoning the batch, and the clip stops a single outlier
+        anchor from dominating the first layer.
+        """
+        if self.feat_center.size == 0:
+            return np.asarray(f, dtype=np.float32)
+        out = (np.asarray(f, dtype=np.float32) - self.feat_center) \
+            / np.maximum(self.feat_scale, 1e-6)
+        return np.clip(np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0), -8.0, 8.0)
 
     def transform_statics(self, s: np.ndarray) -> np.ndarray:
         """Numeric statics only; categorical codes are passed through separately."""
@@ -178,6 +201,8 @@ class Standardizer:
             "target_scale": self.target_scale.tolist(),
             "target_mode": self.target_mode,
             "horizons_min": self.horizons_min,
+            "feat_center": self.feat_center.tolist(),
+            "feat_scale": self.feat_scale.tolist(),
         }
 
     def save(self, path) -> None:
@@ -198,13 +223,20 @@ class Standardizer:
             static_center=blob["static_center"], static_scale=blob["static_scale"],
             target_center=blob["target_center"], target_scale=blob["target_scale"],
             target_mode=blob["target_mode"], horizons_min=blob["horizons_min"],
+            # .get, not [..]: every standardizer.json written before engineered
+            # features existed must still load, or scripts/70_evaluate_all.sh can
+            # no longer re-score a single historical run.
+            feat_center=blob.get("feat_center"), feat_scale=blob.get("feat_scale"),
         )
 
 
 # --------------------------------------------------------------------- fitting
 def fit_standardizer(store, train_mask: np.ndarray, channel_names: Sequence[str],
                      horizon_ids: Sequence[int], target_mode: str = "delta",
-                     n_sample_anchors: int = 200_000, seed: int = 0) -> Standardizer:
+                     n_sample_anchors: int = 200_000, seed: int = 0,
+                     feats: Optional[np.ndarray] = None,
+                     feat_lookup: Optional[np.ndarray] = None,
+                     feat_cols: Optional[np.ndarray] = None) -> Standardizer:
     """Fit every statistic on training anchors only.
 
     Channel statistics are computed over the anchor rows themselves rather than
@@ -274,9 +306,36 @@ def fit_standardizer(store, train_mask: np.ndarray, channel_names: Sequence[str]
     t_centre = np.nan_to_num(t_centre, nan=0.0)
     t_scale = np.where(np.isfinite(t_scale) & (t_scale > 1e-6), t_scale, 1.0)
 
+    # engineered features: robust centre/scale over the SAME sampled TRAIN anchors,
+    # never val/test/holdout -- the standardizer invariant applies here exactly as
+    # it does to channels, statics and targets.
+    f_centre: List[float] = []
+    f_scale: List[float] = []
+    if feats is not None:
+        fi = feat_lookup[idx] if feat_lookup is not None else idx
+        fi = fi[fi >= 0]
+        if fi.size == 0:
+            raise ValueError(
+                "data.features is on but none of the sampled TRAIN anchors have a "
+                "row in the feature matrix; rebuild it over this split's anchors "
+                "(metabonet_forecasting.features.build --anchors ...)")
+        fs = np.asarray(feats[np.sort(fi)], dtype=np.float64)
+        if feat_cols is not None:
+            # Fit on exactly the columns the dataset will serve, or feat_center
+            # is 704 wide against a narrower row and every ablation arm breaks.
+            fs = fs[:, feat_cols]
+        with np.errstate(invalid="ignore"):
+            fc = np.nanmedian(fs, axis=0)
+            fq1 = np.nanquantile(fs, 0.25, axis=0)
+            fq3 = np.nanquantile(fs, 0.75, axis=0)
+        fsc = (fq3 - fq1) / 1.349
+        f_centre = np.nan_to_num(fc, nan=0.0).tolist()
+        f_scale = np.where(np.isfinite(fsc) & (fsc > 1e-6), fsc, 1.0).tolist()
+
     horizons = [store.horizons[i] for i in horizon_ids]
     return Standardizer(stats, centre.tolist(), scale.tolist(),
-                        t_centre.tolist(), t_scale.tolist(), target_mode, horizons)
+                        t_centre.tolist(), t_scale.tolist(), target_mode, horizons,
+                        feat_center=f_centre, feat_scale=f_scale)
 
 
 # ------------------------------------------------------------------- NaN policy

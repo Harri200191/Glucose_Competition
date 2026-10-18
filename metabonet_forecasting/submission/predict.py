@@ -126,6 +126,9 @@ def predict_template(run_dir: Path, store_root: Path, template_path: Path,
         "n_horizons": ds.n_horizons,
         "future_steps": ds.future_shape[0],
         "future_channels": ds.future_shape[1] + 1 if ds.future_shape[1] else 0,
+        # Must mirror dataset.model_input_shapes exactly: a model built here with a
+        # different input width cannot load its own checkpoint.
+        "n_extra_features": ds.n_extra_features,
     }
     model = build_model(cfg, shapes)
     blob = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)

@@ -149,6 +149,37 @@ class StaticEncoder(nn.Module):
         return self.mlp(torch.cat(parts, dim=-1))
 
 
+class FeatureEncoder(nn.Module):
+    """MLP over the engineered per-anchor feature block.
+
+    Wider than StaticEncoder because the input is hundreds of columns rather than
+    six, but the same shape otherwise, and it feeds the same conditioning path --
+    so "engineered features on/off" is one width change and nothing else.
+
+    The output projection is ZERO-INITIALISED, the idiom this repo uses wherever a
+    new information source is added (the CGM foundation-model hybrid projection,
+    the horizon-chaining layers): at step 0 the block contributes exactly nothing,
+    so whatever it earns later is a departure it had to pay for, and the arm is a
+    clean ablation rather than a different model.
+    """
+
+    def __init__(self, n_features: int, d_out: int, hidden: Optional[int] = None,
+                 dropout: float = 0.0) -> None:
+        super().__init__()
+        hidden = hidden or max(d_out * 2, 128)
+        self.net = nn.Sequential(
+            nn.LayerNorm(n_features),
+            nn.Linear(n_features, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, d_out),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        self.d_out = d_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class TimeEncoder(nn.Module):
     """Cyclic calendar features -> a small per-step embedding.
 

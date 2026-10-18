@@ -107,6 +107,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "this is scored on a different patient set, so do it "
                          "deliberately or not at all.")
     ap.set_defaults(internal_holdout=None)
+    ap.add_argument("--no-resume", action="store_true",
+                    help="ignore any last.pt and train from scratch "
+                         "(default is to continue where the run left off)")
     ap.add_argument("--init-from", default=None,
                     help="path to a best.pt checkpoint to warm-start the model weights "
                          "from. The config must build an identical architecture; the "
@@ -174,6 +177,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "provenance": provenance(),
     })
 
+    if a.no_resume:
+        cfg.set_path("training.resume", False)
     trainer = Trainer(model, bundle, cfg, run_dir, log)
     result = trainer.train()
     log.write_json("training_result.json", result)

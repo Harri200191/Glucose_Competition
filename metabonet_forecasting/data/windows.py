@@ -27,6 +27,7 @@ label is read from ``targets.npy``, which prepare.py built from rows strictly af
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -62,6 +63,14 @@ class WindowSpec:
     # How far past the anchor to read. None = out to the longest horizon, so the
     # model sees the interventions covering exactly the span it forecasts.
     future_steps: Optional[int] = None
+    # Directory written by metabonet_forecasting.features.build: a per-anchor
+    # engineered-feature matrix, keyed by POSITIONAL anchor index the way
+    # targets.npy is. None = the feature block is off and x_feat is zero-width.
+    feature_path: Optional[str] = None
+    # "all" | "tier1" | comma-separated family names. The matrix is built once
+    # with every family; a subset selects COLUMNS from it, so an ablation costs
+    # no rebuild and every arm reads the identical file.
+    feature_families: str = "all"
 
     def n_future_steps(self) -> int:
         if not self.future_modalities:
@@ -118,6 +127,15 @@ class WindowSpec:
         if self.future_modalities and self.n_future_steps() <= 0:
             raise ValueError("future_steps must be positive when future "
                              "modalities are requested")
+        if self.feature_path is not None:
+            root = Path(self.feature_path)
+            missing = [f for f in ("features.npy", "lookup.npy", "columns.json")
+                       if not (root / f).exists()]
+            if missing:
+                raise ValueError(
+                    f"data.features.path={self.feature_path!r} is not a feature "
+                    f"build: missing {missing}. Build it with "
+                    "python -m metabonet_forecasting.features.build --out <dir>")
 
 
 class WindowDataset(Dataset):
@@ -146,6 +164,31 @@ class WindowDataset(Dataset):
             m: spec.channels_for(m) for m in self.modalities}
         self.channel_ids: Dict[str, np.ndarray] = {
             m: store.channel_ids(self.channel_names[m]) for m in self.modalities}
+
+        # Engineered features. Memmapped in __init__ so forked DataLoader workers
+        # inherit it, exactly as SequenceStore does with channels/targets.
+        self.feats = None
+        self.feat_lookup = None
+        self.n_feat = 0
+        if spec.feature_path is not None:
+            root = Path(spec.feature_path)
+            self.feats = np.load(root / "features.npy", mmap_mode="r")
+            self.feat_lookup = np.load(root / "lookup.npy")
+            from ..features.spec import select_columns
+            self.feat_cols = select_columns(root, spec.feature_families,
+                                            spec.context)
+            self.n_feat = int(self.feat_cols.size)
+            if self.feat_lookup.shape[0] != len(store.anchors):
+                raise ValueError(
+                    f"feature lookup covers {self.feat_lookup.shape[0]:,} anchors but "
+                    f"the store has {len(store.anchors):,}; the features were built "
+                    "against a different store")
+            miss = int((self.feat_lookup[self.indices] < 0).sum())
+            if miss:
+                # Loudly, rather than serving some other anchor's row.
+                raise ValueError(
+                    f"{miss:,} of {self.indices.size:,} anchors in this split have no "
+                    "row in the feature matrix. Rebuild it over this split's anchors.")
 
         self.horizon_ids = store.horizon_ids(spec.horizons_min)
         a = store.anchors
@@ -188,6 +231,11 @@ class WindowDataset(Dataset):
     # ------------------------------------------------------------------ shapes
     def channel_counts(self) -> Dict[str, int]:
         return {m: len(self.channel_names[m]) for m in self.modalities}
+
+    @property
+    def n_extra_features(self) -> int:
+        """Width of the engineered per-anchor block; 0 when it is off."""
+        return self.n_feat
 
     @property
     def n_time_features(self) -> int:
@@ -272,6 +320,14 @@ class WindowDataset(Dataset):
         else:
             item["static_num"] = torch.zeros(0, dtype=torch.float32)
             item["static_cat"] = torch.zeros(0, dtype=torch.int64)
+
+        if self.feats is not None:
+            fi = int(self.feat_lookup[ai])
+            row = np.asarray(self.feats[fi], dtype=np.float32)[self.feat_cols]
+            item["x_feat"] = torch.from_numpy(self.std.transform_features(row))
+        else:
+            # Zero-width rather than absent: collate stacks a fixed key set.
+            item["x_feat"] = torch.zeros(0, dtype=torch.float32)
 
         y = np.asarray(self.store.targets[ai][self.horizon_ids], dtype=np.float32)
         y_mask = np.isfinite(y).astype(np.float32)

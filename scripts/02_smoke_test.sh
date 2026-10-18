@@ -39,6 +39,13 @@ SMOKE_SET=(
   training.max_steps_per_epoch=30
   training.warmup_steps=5
   training.log_every=10
+  # The smoke store holds no IOBP2 patients, so the internal holdout borrows the
+  # nearest thing it has (AZT1D: Dexcom G6, AID). This only checks that the
+  # holdout is carved, excluded from training and scored -- the smoke store
+  # cannot mimic the annual set and no number here means anything.
+  data.internal_holdout.source=AZT1D
+  data.internal_holdout.n_subjects=5
+  data.internal_holdout.path=artifacts/store/smoke/internal_holdout_smoke.parquet
 )
 
 queue_init

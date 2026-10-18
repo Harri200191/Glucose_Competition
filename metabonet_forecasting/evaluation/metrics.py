@@ -81,6 +81,28 @@ def dts_zones(y_true, y_pred) -> np.ndarray:
     return zone
 
 
+def dts_zone_a_mask(y_true, y_pred) -> np.ndarray:
+    """Boolean "is this prediction in zone A?", elementwise, shape-preserving.
+
+    The same two border expressions as ``dts_zones``' final, overriding
+    assignment, so the two agree by construction -- and ``dts_zones`` itself is
+    deliberately left untouched, because it is the path every reported number
+    goes through and there is no test suite to catch a regression in it
+    (``tests/`` was deleted in e5017de). ``scripts/analysis/_objective_probe.py``
+    checks the two against each other over 200k random points.
+
+    Exists because the training loop needs zone A per epoch, on arrays that still
+    have their [B, H] shape and their mask, where ``dts_zones``' string dtype and
+    flattening would be pure overhead.
+    """
+    ref = np.asarray(y_true, dtype=np.float64)
+    pred = np.asarray(y_pred, dtype=np.float64)
+    ab_up = np.where(ref <= 50, 60.0, (540.0 / 450.0) * (ref - 50) + 60.0)
+    ab_lo = np.where(ref <= 62.5, 0.0, (430.0 / 537.5) * (ref - 62.5) + 50.0)
+    return (np.isfinite(ref) & np.isfinite(pred)
+            & (pred <= ab_up) & (pred >= ab_lo))
+
+
 def clarke_zones(y_true, y_pred) -> np.ndarray:
     ref = np.asarray(y_true, dtype=np.float64)
     pred = np.asarray(y_pred, dtype=np.float64)
