@@ -12,6 +12,10 @@ PatchTST) share one window pipeline, one fusion front end, one multi-horizon hea
 training loop and one evaluation stack, so a measured difference is the backbone and nothing
 else.
 
+**Trained weights:** [Hari93/GlucoChinook](https://huggingface.co/Hari93/GlucoChinook) on
+Hugging Face (MIT). It holds the three-model annual ensemble (Transformer++, MambaFormer,
+Mamba-2), its ensemble recipe, and step-by-step inference instructions.
+
 > Research code. Not a medical device and not validated for insulin dosing. No treatment or
 > safety claim follows from retrospective forecasting accuracy.
 
@@ -93,6 +97,13 @@ context length, generalisation). The competition models were trained with:
 The headers of these scripts state the hypothesis, the settings and the measured effects.
 
 ## Inference
+
+To use the released weights, download them into `runs/`. Each member folder is a run
+directory:
+
+```bash
+hf download Hari93/GlucoChinook --local-dir runs/
+```
 
 Build a submission store from the template, so test windows go through exactly the code that
 built the training data, then predict with a run directory (`best.pt`, `config.resolved.yaml`,
