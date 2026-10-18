@@ -24,7 +24,20 @@ __pycache__/
 /viz_results.py
 
 
-scripts/analysis
+# private analysis scratch, except the two helpers the released recipes call
+scripts/analysis/*
+!scripts/analysis/score_live.py
+!scripts/analysis/_check_capacity.py
 /docs
+/research
+/deck
 
+# the organisers' toolkit (and its live answer key) is cloned in, not redistributed:
+#   git clone https://github.com/replicahealth/glucose-prediction-submission-toolkit.git toolkit
+/toolkit
+
+# local assistant / launcher files
+/CLAUDE.md
+/.claude
 t*.bash
+*.out

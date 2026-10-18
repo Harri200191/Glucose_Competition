@@ -9,9 +9,8 @@ scikit-learn>=1.3
 torch>=2.1
 PyYAML>=6.0
 matplotlib>=3.8   # 3.5 is not numpy-2 compatible
-pytest>=7.0
 
 # Optional. Official Mamba-2 CUDA kernels; needs an Ampere-class GPU. Without it
-# models/mamba2.py uses its pure-PyTorch SSD scan, which is what the tests cover.
+# models/mamba2.py falls back to its pure-PyTorch SSD scan.
 # mamba-ssm>=2.2.0
 # causal-conv1d>=1.4.0
